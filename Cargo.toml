@@ -1,0 +1,33 @@
+[package]
+name = "azalea-reflection-proxy"
+version = "0.1.0"
+edition = "2021"
+
+# Phase 1: passthrough proxy. One bot connects locally (offline mode),
+# the proxy holds the real Microsoft-authed connection to the target.
+# Later phases (multi-viewer, snapshot, control handoff) build on the
+# plugin hooks in relay.rs.
+
+[dependencies]
+# Same stable release as the bot — the proxy must speak the exact same
+# protocol version the bot does.
+azalea-protocol = "0.16"
+azalea-auth = "0.16"
+azalea-crypto = "0.16"
+azalea-buf = "0.16"
+azalea-chat = "0.16"
+azalea-core = "0.16"
+azalea-entity = "0.16"
+azalea-registry = "0.16"
+# same crate/version azalea-client uses to locate ~/.minecraft, so the
+# proxy's auth cache path is identical to Account::microsoft's
+minecraft_folder_path = "0.1.2"
+
+tokio = { version = "1", features = ["full"] }
+parking_lot = "0.12"
+eyre = "0.6"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+async-trait = "0.1"
+uuid = "1.4"
+flate2 = "1.0"
