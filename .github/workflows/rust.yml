@@ -16,6 +16,14 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    # azalea uses nightly-only features (min_specialization,
+    # generic_const_exprs, ...); the runner's preinstalled Rust is
+    # stable, so the build fails without this. Channel is pinned in
+    # rust-toolchain.toml so CI and local builds agree.
+    - name: Install nightly toolchain
+      uses: dtolnay/rust-toolchain@nightly
+    # azalea is a heavy dependency tree; cache target/ and the registry
+    - uses: Swatinem/rust-cache@v2
     - name: Build
       run: cargo build --verbose
     - name: Run tests
