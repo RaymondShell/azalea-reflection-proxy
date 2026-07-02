@@ -1,0 +1,6 @@
+# azalea 0.16 uses nightly-only features (min_specialization,
+# generic_const_exprs, error_generic_member_access, ...), so stable
+# cannot build this crate. rustup picks this up automatically for
+# local builds; CI installs the same channel explicitly.
+[toolchain]
+channel = "nightly"
