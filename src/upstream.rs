@@ -36,6 +36,9 @@ pub struct UpstreamConfig {
     pub port: u16,
     /// Microsoft account email; token cache handled by azalea-auth.
     pub email: String,
+    /// Auth cache override; None = PROXY_AUTH_CACHE env or azalea's
+    /// standard `~/.minecraft/azalea-auth.json`.
+    pub auth_cache: Option<std::path::PathBuf>,
 }
 
 /// Where refreshed Microsoft tokens live between runs. Defaults to the
@@ -56,7 +59,7 @@ pub async fn connect(cfg: &UpstreamConfig) -> Result<Upstream> {
 
     // 1. Auth with Microsoft. Without cache_file azalea-auth keeps NO
     // cache and forces the device-code flow on every launch.
-    let cache_file = auth_cache_file();
+    let cache_file = cfg.auth_cache.clone().or_else(auth_cache_file);
     if cache_file.is_none() {
         tracing::warn!("could not locate .minecraft dir; auth will not be cached");
     }

@@ -19,6 +19,39 @@ Bot-side change: `Account::offline("reflected")` → `127.0.0.1:25566`
 instead of `Account::microsoft(...)` → `hypixel.net`. The proxy does the
 Microsoft auth now (same azalea-auth token cache).
 
+## Usage as a library (the intended way)
+
+Add the crate to your bot (path dependency until published):
+
+```toml
+[dependencies]
+azalea-reflection-proxy = { path = "../azalea-reflection-proxy" }
+```
+
+Then spawn the proxy in-process and point your azalea bot at it — two
+changed lines relative to a normal bot:
+
+```rust
+use azalea_reflection_proxy::ReflectionProxy;
+
+let proxy = ReflectionProxy::builder()
+    .target("mc.hypixel.net")
+    .email("account@example.com")   // proxy owns the Microsoft auth now
+    .spawn()
+    .await?;
+
+ClientBuilder::new()
+    .set_handler(handle)
+    .start(Account::offline("reflected"), proxy.local_addr())  // was: microsoft + real host
+    .await?;
+```
+
+Spectate by adding a vanilla-client server entry for the same address
+(default `127.0.0.1:25566`; `.bind("127.0.0.1:0")` picks a free port).
+Custom frame plugins implement `ProxyPlugin` and register with
+`.plugin(...)`. The standalone binary (`cargo run`, env-var config)
+still exists as a thin wrapper over the same builder.
+
 ## Honest state
 
 All four phases are implemented and compile; phases 1-2 (passthrough +
