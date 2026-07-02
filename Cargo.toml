@@ -2,11 +2,15 @@
 name = "azalea-reflection-proxy"
 version = "0.1.0"
 edition = "2021"
-
-# Phase 1: passthrough proxy. One bot connects locally (offline mode),
-# the proxy holds the real Microsoft-authed connection to the target.
-# Later phases (multi-viewer, snapshot, control handoff) build on the
-# plugin hooks in relay.rs.
+description = "Spectate and take over an azalea bot session live through a local reflection proxy — Rust port of mineflayer-reflection-proxy"
+license = "MIT"
+repository = "https://github.com/RaymondShell/azalea-reflection-proxy"
+readme = "README.md"
+keywords = ["minecraft", "azalea", "proxy", "bot", "spectator"]
+categories = ["game-development", "network-programming"]
+# requires nightly (azalea uses unstable features); docs.rs already
+# builds with nightly by default
+exclude = [".github/", ".idea/"]
 
 [dependencies]
 # Same stable release as the bot — the proxy must speak the exact same
