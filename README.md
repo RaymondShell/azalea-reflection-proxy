@@ -152,11 +152,3 @@ frames they need.
 
 The local leg is offline-mode by design. Never bind it beyond loopback:
 anyone who can reach the port can drive the authenticated session.
-
-## Anticheat honesty
-
-The original's "anticheat compliance" claim was for THEIR proxy + THEIR
-configured mineflayer at protocol 1.8.9. None of that transfers. This
-build revalidates that property from zero, and handoff timing artifacts
-are exactly the kind of thing movement checks notice. Test on something
-disposable first.
