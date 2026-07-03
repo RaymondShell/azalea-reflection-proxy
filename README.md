@@ -63,13 +63,51 @@ as of 2026-07-02.
 
 - `,acquire` — take control of the session (steals it if someone else
   has it; they become a spectator)
-- `,release` / `,spectate` — give up control; the proxy answers
-  keepalives and teleport confirms itself so the session stays alive
-  with nobody driving
+- `,release` — give up control; the proxy answers keepalives and
+  teleport confirms itself so the session stays alive with nobody
+  driving (unless `always_first_control` is on, in which case the
+  oldest viewer inherits control)
+- `,spectate [username]` — lock the camera to a player entity (no arg
+  = the reflected bot; repeat with no arg to detach). Viewers only.
+- `,gamemode <survival|creative|adventure|spectator|0-3>` —
+  client-side game mode for the issuing viewer
 
-### What is NOT ported
+### Builder options beyond the basics
 
-- `anonymize.js` (name-masking for streams) — niche, omitted.
+- `.whitelist(["Name", ...])` — only these usernames may connect
+  (case-insensitive); everyone else gets a disconnect message
+- `.max_clients(n)` — cap simultaneous clients
+- `.always_first_control(true)` — original's `alwaysFirstControl`
+- `.plugin(Box::new(...))` — frame-level ProxyPlugin pipeline
+
+### Events (port of the original's server events)
+
+```rust
+let mut events = proxy.subscribe();
+tokio::spawn(async move {
+    while let Ok(ev) = events.recv().await {
+        // ProxyEvent::{SessionStarted, SessionEnded, ClientJoined,
+        //              ClientLeft, ControlChanged}
+        println!("{ev:?}");
+    }
+});
+```
+
+### What is NOT ported (and why)
+
+- `,connect` + the limbo world (`noLimbo`, `spawnPosition`) — clients
+  here replicate immediately on join, which is exactly what the
+  original's `createBotReflected` integration mode forces
+  (`noLimbo: true`); a limbo lobby only matters for its standalone
+  public-server mode.
+- `version` option — the protocol version is pinned by the azalea
+  release this crate builds against.
+- Physics simulation while uncontrolled — the original hosts a
+  mineflayer bot in-process and re-enables its physics; here the bot
+  is your own azalea process, so the proxy stands in (keepalives +
+  teleport confirms) and the player idles server-side instead.
+- `spoofUsername`/anonymize — would require rewriting every forwarded
+  player-info/chat frame; omitted.
 - The explosion-velocity handoff trick from synchronization.js —
   handoff here aligns position with a plain teleport (the GrimAC-style
   option from the original's README); momentum is not carried over.

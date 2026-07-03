@@ -43,10 +43,34 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use eyre::Result;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 pub use plugin::{Frame, Pipeline, ProxyPlugin, Verdict};
+pub use session::ClientId;
+
+/// Things happening inside the proxy that the host program may care
+/// about — the port of the original's `clientJoin`/`changeControl`
+/// server events. Subscribe with [`ReflectionProxy::subscribe`].
+#[derive(Clone, Debug)]
+pub enum ProxyEvent {
+    /// A session (upstream connection) was established.
+    SessionStarted,
+    /// The session ended; the next client starts a fresh one.
+    SessionEnded,
+    ClientJoined {
+        id: ClientId,
+        username: String,
+    },
+    ClientLeft {
+        id: ClientId,
+        username: String,
+    },
+    /// Control moved (None = controllerless; the proxy stands in).
+    ControlChanged {
+        controller: Option<(ClientId, String)>,
+    },
+}
 
 /// Configuration for a reflection proxy. Build with
 /// [`ReflectionProxy::builder`].
@@ -57,6 +81,9 @@ pub struct ProxyBuilder {
     email: String,
     auth_cache: Option<PathBuf>,
     plugins: Vec<Box<dyn ProxyPlugin>>,
+    whitelist: Vec<String>,
+    max_clients: Option<usize>,
+    always_first_control: bool,
 }
 
 impl Default for ProxyBuilder {
@@ -68,6 +95,9 @@ impl Default for ProxyBuilder {
             email: String::new(),
             auth_cache: None,
             plugins: Vec::new(),
+            whitelist: Vec::new(),
+            max_clients: None,
+            always_first_control: false,
         }
     }
 }
@@ -116,6 +146,28 @@ impl ProxyBuilder {
         self
     }
 
+    /// Only allow these usernames to connect (case-insensitive). Empty
+    /// (the default) = anyone who can reach the bind address.
+    pub fn whitelist<I: IntoIterator<Item = S>, S: Into<String>>(mut self, names: I) -> Self {
+        self.whitelist = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Cap simultaneous clients (controller + viewers). Default: no cap.
+    pub fn max_clients(mut self, max: usize) -> Self {
+        self.max_clients = Some(max);
+        self
+    }
+
+    /// When the controller disconnects, hand control to the oldest
+    /// connected viewer instead of going controllerless (the original's
+    /// `alwaysFirstControl`). Default: off — the proxy stands in and the
+    /// session idles until someone runs `,acquire`.
+    pub fn always_first_control(mut self, on: bool) -> Self {
+        self.always_first_control = on;
+        self
+    }
+
     /// Bind the listener and start accepting clients in the background.
     pub async fn spawn(self) -> Result<ReflectionProxy> {
         if self.email.is_empty() {
@@ -137,12 +189,25 @@ impl ProxyBuilder {
             plugins: self.plugins,
         });
         let registry: SessionRegistry = Arc::new(Mutex::new(None));
+        let (events_tx, _) = broadcast::channel(256);
+        let shared = Arc::new(Shared {
+            cfg,
+            pipeline,
+            registry,
+            events: events_tx.clone(),
+            whitelist: self.whitelist,
+            opts: session::SessionOpts {
+                max_clients: self.max_clients,
+                always_first_control: self.always_first_control,
+            },
+        });
 
-        let accept_task = tokio::spawn(accept_loop(listener, cfg, pipeline, registry));
+        let accept_task = tokio::spawn(accept_loop(listener, shared));
 
         Ok(ReflectionProxy {
             local_addr,
             accept_task,
+            events: events_tx,
         })
     }
 }
@@ -152,11 +217,20 @@ impl ProxyBuilder {
 pub struct ReflectionProxy {
     local_addr: SocketAddr,
     accept_task: JoinHandle<()>,
+    events: broadcast::Sender<ProxyEvent>,
 }
 
 impl ReflectionProxy {
     pub fn builder() -> ProxyBuilder {
         ProxyBuilder::default()
+    }
+
+    /// Subscribe to proxy events (client joins/leaves, control changes,
+    /// session lifecycle). Each subscriber gets every event from the
+    /// moment it subscribes; slow subscribers may observe
+    /// [`broadcast::error::RecvError::Lagged`].
+    pub fn subscribe(&self) -> broadcast::Receiver<ProxyEvent> {
+        self.events.subscribe()
     }
 
     /// The address your bot (`Account::offline(...)`) and any vanilla
@@ -183,14 +257,19 @@ impl ReflectionProxy {
 /// next connection becomes a fresh controller.
 type SessionRegistry = Arc<Mutex<Option<mpsc::Sender<session::SessionMsg>>>>;
 
-static NEXT_CLIENT_ID: AtomicU32 = AtomicU32::new(1);
-
-async fn accept_loop(
-    listener: tokio::net::TcpListener,
+/// Everything the accept path needs, bundled once at spawn.
+struct Shared {
     cfg: Arc<upstream::UpstreamConfig>,
     pipeline: Arc<Pipeline>,
     registry: SessionRegistry,
-) {
+    events: broadcast::Sender<ProxyEvent>,
+    whitelist: Vec<String>,
+    opts: session::SessionOpts,
+}
+
+static NEXT_CLIENT_ID: AtomicU32 = AtomicU32::new(1);
+
+async fn accept_loop(listener: tokio::net::TcpListener, shared: Arc<Shared>) {
     loop {
         let (stream, addr) = match listener.accept().await {
             Ok(x) => x,
@@ -200,9 +279,9 @@ async fn accept_loop(
             }
         };
         tracing::info!("connection from {addr}");
-        let (cfg, pipeline, registry) = (cfg.clone(), pipeline.clone(), registry.clone());
+        let shared = shared.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, cfg, pipeline, registry).await {
+            if let Err(e) = handle_connection(stream, shared).await {
                 // status pings land here too, so this is not an error
                 tracing::info!("connection ended: {e:#}");
             }
@@ -210,20 +289,34 @@ async fn accept_loop(
     }
 }
 
-async fn handle_connection(
-    stream: tokio::net::TcpStream,
-    cfg: Arc<upstream::UpstreamConfig>,
-    pipeline: Arc<Pipeline>,
-    registry: SessionRegistry,
-) -> Result<()> {
-    let local = local_server::accept_login(stream).await?;
+async fn handle_connection(stream: tokio::net::TcpStream, shared: Arc<Shared>) -> Result<()> {
+    let mut local = local_server::accept_login(stream).await?;
     let username = local.username.clone();
+
+    if !shared.whitelist.is_empty()
+        && !shared
+            .whitelist
+            .iter()
+            .any(|w| w.eq_ignore_ascii_case(&username))
+    {
+        use azalea_chat::FormattedText;
+        use azalea_protocol::packets::config::c_disconnect::ClientboundDisconnect;
+        tracing::info!("'{username}' rejected: not whitelisted");
+        let _ = local
+            .connection
+            .write(ClientboundDisconnect {
+                reason: FormattedText::from("not on this proxy's whitelist"),
+            })
+            .await;
+        return Ok(());
+    }
+
     let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
 
     // Held across the upstream connect on purpose: a second client that
     // races in while the controller is still authenticating waits here,
     // then attaches as a viewer instead of spawning a second session.
-    let mut guard = registry.lock().await;
+    let mut guard = shared.registry.lock().await;
 
     if let Some(tx) = guard.as_ref().filter(|tx| !tx.is_closed()).cloned() {
         drop(guard);
@@ -233,9 +326,16 @@ async fn handle_connection(
     }
 
     tracing::info!("'{username}' is the controller (client {id}); connecting upstream");
-    let up = upstream::connect(&cfg).await?;
+    let up = upstream::connect(&shared.cfg).await?;
     tracing::info!("upstream established as {}", up.profile.name);
 
-    *guard = Some(session::spawn(up, local, id, pipeline));
+    *guard = Some(session::spawn(
+        up,
+        local,
+        id,
+        shared.pipeline.clone(),
+        shared.opts.clone(),
+        shared.events.clone(),
+    ));
     Ok(())
 }

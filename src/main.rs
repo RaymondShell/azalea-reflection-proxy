@@ -9,10 +9,12 @@ use eyre::Result;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().init();
 
+    let email = std::env::var("PROXY_EMAIL")
+        .map_err(|_| eyre::eyre!("set PROXY_EMAIL to the Microsoft account email"))?;
     let mut b = ReflectionProxy::builder()
         .bind(std::env::var("PROXY_BIND").unwrap_or_else(|_| "127.0.0.1:25566".into()))
-        .target(std::env::var("PROXY_TARGET").unwrap_or_else(|_| "mc.hypixel.net".into()))
-        .email(std::env::var("PROXY_EMAIL").unwrap_or_else(|_| "restsidcrotibig@mail.com".into()));
+        .target(std::env::var("PROXY_TARGET").unwrap_or_else(|_| "localhost".into()))
+        .email(email);
     if let Ok(cache) = std::env::var("PROXY_AUTH_CACHE") {
         b = b.auth_cache(cache);
     }
