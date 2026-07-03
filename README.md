@@ -1,11 +1,12 @@
 # azalea-reflection-proxy
 
-Rust/azalea port of the architecture from
+Rust/azalea port of
 [aesthetic0001/mineflayer-reflection-proxy](https://github.com/aesthetic0001/mineflayer-reflection-proxy):
 "replay mod, but live." The proxy owns the single real Microsoft-authed
-connection to the target server; the bot (and later, vanilla-client viewers)
+connection to the target server; your bot and any vanilla-client viewers
 connect to the proxy locally. Whoever holds control drives the session;
-everyone else watches.
+everyone else spectates — and control can move between clients at any
+time with a chat command.
 
 ## Why the bot connects THROUGH the proxy
 
@@ -17,19 +18,20 @@ it's just changing whose serverbound packets get forwarded.
 
 Bot-side change: `Account::offline("reflected")` → `127.0.0.1:25566`
 instead of `Account::microsoft(...)` → `hypixel.net`. The proxy does the
-Microsoft auth now (same azalea-auth token cache).
+Microsoft auth now (same azalea-auth token cache, so login is interactive
+at most once per account).
 
-## Usage as a library (the intended way)
+## Usage
 
 Add the crate to your bot:
 
 ```toml
 [dependencies]
-azalea-reflection-proxy = "0.1.0"
+azalea-reflection-proxy = "0.1"
 ```
 
-Then spawn the proxy in-process and point your azalea bot at it — two
-changed lines relative to a normal bot:
+Spawn the proxy in-process and point your azalea bot at it — two changed
+lines relative to a normal bot:
 
 ```rust
 use azalea_reflection_proxy::ReflectionProxy;
@@ -48,16 +50,10 @@ ClientBuilder::new()
 
 Spectate by adding a vanilla-client server entry for the same address
 (default `127.0.0.1:25566`; `.bind("127.0.0.1:0")` picks a free port).
-Custom frame plugins implement `ProxyPlugin` and register with
-`.plugin(...)`. The standalone binary (`cargo run`, env-var config)
-still exists as a thin wrapper over the same builder.
-
-## Honest state
-
-All four phases are implemented and compile; phases 1-2 (passthrough +
-replicator basics) have been tested live. Phases 3-4 (world snapshot,
-spectator fix, control handoff, controllerless stand-in) are untested
-as of 2026-07-02.
+The client must be on the same protocol version as the azalea release
+this crate builds against. A standalone binary (`cargo run`, configured
+via `PROXY_EMAIL` / `PROXY_TARGET` / `PROXY_BIND` / `PROXY_AUTH_CACHE`
+env vars) wraps the same builder.
 
 ### Commands (type in chat from any connected client)
 
@@ -93,7 +89,71 @@ tokio::spawn(async move {
 });
 ```
 
-### What is NOT ported (and why)
+## How it works (module map)
+
+- Session actor (`session.rs`) — one task owns each session: clientbound
+  traffic broadcast to every client, serverbound forwarded only from the
+  controller, viewers' acks/keepalives swallowed. Handles the `,command`
+  set, control handoff (the acquiring client gets the real game mode +
+  abilities back, the ghost bot entity removed, and a teleport onto the
+  bot's pose with its accept swallowed), and the controllerless
+  stand-in: with nobody driving, the proxy answers keepalives and
+  confirms teleports itself, so the session survives the bot process
+  exiting entirely.
+- Join replay (`session.rs` + `snapshot.rs`) — viewers joining
+  mid-session get cached config frames + a synthesized
+  FinishConfiguration, then Login, Respawn (if the session changed
+  dimension), position, Game Event 13, the full raw chunk cache, and
+  the world snapshot. Chunk replay is a hard requirement: the vanilla
+  client won't leave "Loading terrain..." until the chunk under its
+  feet loads.
+- World snapshot (`snapshot.rs`) — the snapshot.js port: entities (with
+  positions accumulated from relative moves), tab list (merged
+  player-info entries), scoreboards/teams, player inventory,
+  health/food/xp, time, held slot and weather, cached as raw frames.
+- Spectator viewers (`reflect.rs`) — viewers get the full spectator kit
+  on join (own-uuid player info + game event + abilities — modern
+  clients key game mode off the player-info entry, so the event alone
+  is not enough), re-asserted after every Login/Respawn broadcast. They
+  see the bot as a synthesized player entity mirrored live from the
+  controller's serverbound movement packets. The session's own
+  teleports, abilities, and game-mode changes are filtered away from
+  viewers so their free camera survives; one position frame is let
+  through after dimension changes so they land in the new world.
+- Login legs (`upstream.rs`, `local_server.rs`) — full Microsoft auth +
+  encryption + compression dance upstream; offline-mode mirror locally
+  (uncompressed, loopback only).
+- Plugin pipeline (`plugin.rs`) — Forward / Drop / Replace verdicts on
+  raw frames, in registration order, mirroring the original's plugin
+  semantics (`onReadReal` ≈ `on_clientbound`, `onWriteReal` ≈
+  `on_serverbound`, `bindToReflected` ≈ `on_session_start`).
+- Packet ids (`ids.rs`) — every id the proxy matches on, pinned by
+  `cargo test` against azalea's own encoders where construction is
+  cheap; Login has a runtime first-game-frame guard instead. Includes a
+  canary test for an azalea 0.16 bug (its `player_info_update` writer
+  omits `update_list_order`/`update_hat` entry data) so a fixed azalea
+  release announces itself as a test failure.
+
+## Why frames, not bytes, not typed packets
+
+Byte forwarding is impossible: the upstream leg is encrypted with keys
+the proxy negotiated. Fully-typed forwarding is unnecessary and fragile:
+the proxy shouldn't break because it can't parse a packet it doesn't
+care about. Raw frames (packet id + body after decrypt/decompress) are
+the middle ground — the relay interprets nothing, and only the code
+that needs a specific packet (snapshot, reflected entity, commands)
+parses that one packet.
+
+## Status
+
+Everything above is implemented; the passthrough and replicator paths
+(bot through proxy, viewer join, terrain + spectator mode) have been
+tested live. The newer surfaces — control handoff, `,spectate` camera,
+events, whitelist/max_clients — have unit-test coverage but no live
+mileage yet. Treat `,acquire` with care on anticheat-guarded servers:
+position is aligned on handoff, but momentum is not carried over.
+
+## What is NOT ported (and why)
 
 - `,connect` + the limbo world (`noLimbo`, `spawnPosition`) — clients
   here replicate immediately on join, which is exactly what the
@@ -114,79 +174,9 @@ tokio::spawn(async move {
 - Skin textures on the reflected bot entity (needs a signed
   sessionserver profile lookup); it renders with a default skin.
 
-- Plugin pipeline (`plugin.rs`) — Forward / Drop / Replace verdicts on
-  raw frames, mirroring the original's plugin order semantics. Wired but
-  no plugin exists yet, so Drop/Replace paths are unexercised.
-- Frame adapters (`relay.rs`) — FrameSource/FrameSink over azalea's raw
-  connection halves. Done.
-- Login legs (`upstream.rs`, `local_server.rs`) — full Microsoft auth +
-  encryption + compression dance upstream; offline-mode mirror locally
-  (uncompressed, loopback only). Done, live-tested.
-- Session actor (`session.rs`) — one task owns the session: clientbound
-  broadcast to all clients, serverbound forwarded only from the
-  controller, viewers' acks/keepalives swallowed. Viewers joining
-  mid-session get a join replay: cached config frames + synthesized
-  FinishConfiguration, then Login, Respawn (if the session changed
-  dimension), position, Game Event 13, and the full raw chunk cache —
-  chunks turned out to be a hard join requirement, since the vanilla
-  client won't leave "Loading terrain..." until the chunk under its
-  feet loads. Entities/inventory/health are still phase 3, so a fresh
-  viewer sees terrain but no mobs/items until live traffic fills in.
-  Controller leaving tears the session down (handoff is phase 4).
-- Spectator viewers (`reflect.rs`) — viewers get the full spectator
-  kit on join (own-uuid player info + game event + abilities; modern
-  clients key game mode off the player-info entry, so the event alone
-  is not enough) and see the bot as a synthesized player entity,
-  mirrored live from the controller's serverbound movement packets
-  (the reason the bot routes through the proxy at all). The kit is
-  re-asserted after every Login/Respawn broadcast, which would
-  otherwise reset it. The session's own teleports, abilities, and
-  game-mode changes are filtered away from viewers so their free
-  camera survives; one position frame is let through after dimension
-  changes so they land in the new world.
-- World snapshot (`snapshot.rs`) — the snapshot.js port: entities
-  (with positions accumulated from relative moves), tab list (merged
-  player-info entries), scoreboards/teams, player inventory, health/
-  food/xp, time, held slot and weather, all cached as raw frames and
-  replayed to joining viewers after the chunks.
-- Synchronization (`session.rs` + `reflect.rs`) — `,acquire` and
-  `,release`/`,spectate` chat commands port synchronization.js: the
-  acquiring client gets the real game mode + abilities back, the ghost
-  bot entity removed, and a teleport onto the bot's pose (its accept
-  is swallowed); the demoted client gets the spectator kit and the
-  ghost back. With no controller the proxy stands in, answering
-  keepalives and confirming teleports, so the session survives the
-  bot disconnecting entirely.
-- Packet ids (`ids.rs`) — the few ids the proxy matches on, pinned by
-  `cargo test` against azalea's own packet types where construction is
-  cheap; Login has a runtime first-game-frame guard instead.
-
-## Why frames, not bytes, not typed packets
-
-Byte forwarding is impossible: the upstream leg is encrypted with keys the
-proxy negotiated. Fully-typed forwarding is unnecessary and fragile: the
-proxy shouldn't break because it can't parse a packet it doesn't care
-about. Raw frames (packet id + body after decrypt/decompress) are the
-middle ground — phase 1 interprets nothing; later plugins parse only the
-frames they need.
-
-## Phase roadmap (mirrors the original's plugin list)
-
-1. **Passthrough** — done, live-tested: one bot, faithful relay.
-2. **Replicator** — implemented, untested: extra viewer connections
-   attach to the running session; clientbound broadcast to all;
-   serverbound forwarded only from the control-holder; viewers'
-   keepalive replies and teleport confirms swallowed at the proxy.
-3. **Snapshot**: cache login/registry/chunks/entities/inventory/health so
-   a viewer can join mid-session and be synced to current state. Biggest
-   single work item.
-4. **Control handoff + reflected entity + physics sync**: `,acquire` /
-   `,release` chat commands, synthesize a player entity representing the
-   controlled character for non-controllers, align positions on handoff
-   (azalea-physics-backed simulation, the GrimAC-style option from the
-   original's README).
-
 ## Security note
 
 The local leg is offline-mode by design. Never bind it beyond loopback:
-anyone who can reach the port can drive the authenticated session.
+anyone who can reach the port can drive the authenticated session. If
+you must share it, `.whitelist(...)` and `.max_clients(...)` reduce the
+blast radius — they do not make it safe on the open internet.
