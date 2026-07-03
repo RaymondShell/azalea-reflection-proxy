@@ -52,6 +52,7 @@ pub struct WorldSnapshot {
 
 struct EntityRecord {
     add: Frame,
+    uuid: Uuid,
     pos: Vec3,
     /// (y_rot, x_rot) in compact protocol angles.
     look: (i8, i8),
@@ -111,6 +112,7 @@ impl WorldSnapshot {
                         p.id.0,
                         EntityRecord {
                             add: f.clone(),
+                            uuid: p.uuid,
                             pos: p.position,
                             look: (p.y_rot, p.x_rot),
                             head_rot: p.y_head_rot,
@@ -340,6 +342,20 @@ impl WorldSnapshot {
             },
             _ => {}
         }
+    }
+
+    /// Entity id of a visible player by (case-insensitive) name, via
+    /// the tab list — for `,spectate <username>`.
+    pub fn entity_id_for_player(&self, name: &str) -> Option<i32> {
+        let uuid = self
+            .players
+            .values()
+            .find(|e| e.profile.name.eq_ignore_ascii_case(name))
+            .map(|e| e.profile.uuid)?;
+        self.entities
+            .iter()
+            .find(|(_, e)| e.uuid == uuid)
+            .map(|(&id, _)| id)
     }
 
     /// Everything a fresh viewer needs after login/position/chunks, in

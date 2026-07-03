@@ -23,9 +23,22 @@ use std::sync::Arc;
 use azalea_protocol::connect::Connection;
 use azalea_protocol::packets::config::{ClientboundConfigPacket, ServerboundConfigPacket};
 use eyre::Result;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use uuid::Uuid;
+
+use crate::ProxyEvent;
+
+/// Behavior knobs forwarded from the builder.
+#[derive(Clone)]
+pub struct SessionOpts {
+    /// Refuse attaches beyond this many simultaneous clients.
+    pub max_clients: Option<usize>,
+    /// When the controller disconnects, promote the oldest live client
+    /// instead of going controllerless (the original's
+    /// `alwaysFirstControl`).
+    pub always_first_control: bool,
+}
 
 use crate::ids;
 use crate::local_server::LocalClient;
@@ -68,6 +81,8 @@ struct ClientHandle {
     /// Swallow the accept for a proxy-synthesized handoff teleport so it
     /// never reaches the server.
     swallow_next_accept: bool,
+    /// `,spectate` camera lock currently active for this viewer.
+    camera_on: bool,
 }
 
 /// Join cache: config replay + world state a late viewer needs. Chunks
@@ -150,6 +165,11 @@ struct Session {
     /// (their camera is free), but after a dimension change they need
     /// exactly one to land in the new world.
     forward_next_position: bool,
+    /// The session player's entity id from the Login packet — a
+    /// viewer's own client entity, used to detach `,spectate` cameras.
+    real_player_id: Option<i32>,
+    opts: SessionOpts,
+    events: broadcast::Sender<ProxyEvent>,
 }
 
 /// Start a session: the controller is already logged in locally, the
@@ -161,6 +181,8 @@ pub fn spawn(
     controller: LocalClient,
     controller_id: ClientId,
     pipeline: Arc<Pipeline>,
+    opts: SessionOpts,
+    events: broadcast::Sender<ProxyEvent>,
 ) -> mpsc::Sender<SessionMsg> {
     tracing::info!(
         "session start: controller '{}', upstream compression threshold {:?}",
@@ -187,9 +209,19 @@ pub fn spawn(
             username: controller.username.clone(),
             uuid: controller.uuid,
             swallow_next_accept: false,
+            camera_on: false,
         },
     );
     start_client_io(controller_id, controller.connection, msg_tx.clone(), ctl_rx);
+
+    let _ = events.send(ProxyEvent::SessionStarted);
+    let _ = events.send(ProxyEvent::ClientJoined {
+        id: controller_id,
+        username: controller.username.clone(),
+    });
+    let _ = events.send(ProxyEvent::ControlChanged {
+        controller: Some((controller_id, controller.username.clone())),
+    });
 
     let session = Session {
         pipeline,
@@ -206,6 +238,9 @@ pub fn spawn(
         abilities: None,
         respawn_entity_pending: false,
         forward_next_position: false,
+        real_player_id: None,
+        opts,
+        events,
     };
     tokio::spawn(session.run(msg_rx));
     msg_tx
@@ -235,14 +270,17 @@ pub async fn attach_viewer(
     Ok(())
 }
 
-/// Game mode of the session player, from the Login packet's spawn info.
-fn login_game_mode(f: &Frame) -> Option<u8> {
+/// Game mode and player entity id of the session player, from the
+/// Login packet.
+fn login_info(f: &Frame) -> (Option<u8>, Option<i32>) {
     use azalea_protocol::packets::ProtocolPacket;
     use azalea_protocol::packets::game::ClientboundGamePacket;
     use std::io::Cursor;
     match ClientboundGamePacket::read(f.packet_id, &mut Cursor::new(&f.body[..])) {
-        Ok(ClientboundGamePacket::Login(l)) => Some(l.common.game_type.to_id()),
-        _ => None,
+        Ok(ClientboundGamePacket::Login(l)) => {
+            (Some(l.common.game_type.to_id()), Some(l.player_id.0))
+        }
+        _ => (None, None),
     }
 }
 
@@ -351,6 +389,7 @@ impl Session {
             "session ended ({} client(s) still attached will be dropped)",
             self.clients.len()
         );
+        let _ = self.events.send(ProxyEvent::SessionEnded);
     }
 
     async fn on_upstream_frame(&mut self, frame: Frame) {
@@ -428,7 +467,9 @@ impl Session {
                 match f.packet_id {
                     ids::CB_GAME_LOGIN => {
                         self.cache.login = Some(f.clone());
-                        self.real_game_mode = login_game_mode(f).unwrap_or(0);
+                        let (mode, pid) = login_info(f);
+                        self.real_game_mode = mode.unwrap_or(0);
+                        self.real_player_id = pid;
                         // reconfiguration path: Live viewers' entities were
                         // wiped and they need the upcoming position
                         self.respawn_entity_pending = true;
@@ -569,11 +610,16 @@ impl Session {
         Ok(())
     }
 
-    /// `,acquire` / `,release` / `,spectate` — the port of the original's
-    /// synchronization plugin + command set.
+    /// The `,command` set — port of the original's synchronization
+    /// plugin plus its command modules (acquire/release/spectate/
+    /// gamemode).
     async fn handle_command(&mut self, id: ClientId, cmd: &str) -> Result<()> {
         tracing::info!("client {id} issued command: {cmd}");
-        match cmd {
+        let (verb, arg) = match cmd.split_once(' ') {
+            Some((v, a)) => (v, a.trim()),
+            None => (cmd, ""),
+        };
+        match verb {
             ",acquire" => {
                 if Some(id) == self.controller {
                     self.feedback(id, "you already have control");
@@ -587,18 +633,96 @@ impl Session {
                 self.promote_to_controller(id);
                 self.feedback(id, "you have control now");
             }
-            ",release" | ",spectate" => {
+            ",release" => {
                 if Some(id) == self.controller {
                     self.controller = None;
                     self.demote_to_spectator(id);
                     self.feedback(id, "control released; proxy is keeping the session alive");
+                    let _ = self.events.send(ProxyEvent::ControlChanged { controller: None });
                 } else {
                     self.feedback(id, "you are not the controller");
                 }
             }
-            _ => self.feedback(id, "commands: ,acquire ,release ,spectate"),
+            ",spectate" => self.cmd_spectate(id, arg),
+            ",gamemode" | ",gm" => self.cmd_gamemode(id, arg),
+            _ => self.feedback(
+                id,
+                "commands: ,acquire ,release ,spectate [player] ,gamemode <0-3|name>",
+            ),
         }
         Ok(())
+    }
+
+    /// `,spectate [username]` — lock the camera to a player entity (no
+    /// arg = the reflected bot; repeat with no arg to detach).
+    fn cmd_spectate(&mut self, id: ClientId, arg: &str) {
+        if Some(id) == self.controller {
+            self.feedback(id, ",release first — the controller cannot spectate");
+            return;
+        }
+        let camera_on = match self.clients.get(&id) {
+            Some(c) => c.camera_on,
+            None => return,
+        };
+        let (target, turning_on) = if arg.is_empty() {
+            if camera_on {
+                // toggle off: back to the viewer's own client entity
+                let Some(own) = self.real_player_id else {
+                    self.feedback(id, "cannot detach camera yet (no login seen)");
+                    return;
+                };
+                (own, false)
+            } else {
+                (reflect::REFLECTED_ENTITY_ID, true)
+            }
+        } else if arg.eq_ignore_ascii_case(&self.bot_name) {
+            (reflect::REFLECTED_ENTITY_ID, true)
+        } else {
+            match self.cache.world.entity_id_for_player(arg) {
+                Some(eid) => (eid, true),
+                None => {
+                    self.feedback(id, "player not found (not in render distance?)");
+                    return;
+                }
+            }
+        };
+        if let Some(c) = self.clients.get_mut(&id) {
+            let _ = c.tx.try_send(reflect::camera_frame(target));
+            c.camera_on = turning_on;
+        }
+        self.feedback(
+            id,
+            if turning_on {
+                "camera attached — ,spectate again to detach"
+            } else {
+                "camera detached"
+            },
+        );
+    }
+
+    /// `,gamemode <0-3|name>` — client-side game mode for the issuing
+    /// viewer only (nothing reaches the server).
+    fn cmd_gamemode(&mut self, id: ClientId, arg: &str) {
+        if Some(id) == self.controller {
+            self.feedback(id, "not while controlling — it would desync your client");
+            return;
+        }
+        let mode = match arg.to_ascii_lowercase().as_str() {
+            "0" | "survival" => 0u8,
+            "1" | "creative" => 1,
+            "2" | "adventure" => 2,
+            "3" | "spectator" => 3,
+            _ => {
+                self.feedback(id, "usage: ,gamemode <survival|creative|adventure|spectator|0-3>");
+                return;
+            }
+        };
+        if let Some(c) = self.clients.get(&id) {
+            for f in reflect::gamemode_kit(c.uuid, &c.username, mode) {
+                let _ = c.tx.try_send(f);
+            }
+        }
+        self.feedback(id, "client-side game mode updated");
     }
 
     fn feedback(&mut self, id: ClientId, msg: &str) {
@@ -638,8 +762,17 @@ impl Session {
         }
         if let Some(c) = self.clients.get_mut(&id) {
             c.swallow_next_accept = has_teleport;
+            c.camera_on = false; // controller drives its own camera
         }
         self.controller = Some(id);
+        let username = self
+            .clients
+            .get(&id)
+            .map(|c| c.username.clone())
+            .unwrap_or_default();
+        let _ = self.events.send(ProxyEvent::ControlChanged {
+            controller: Some((id, username)),
+        });
     }
 
     /// Re-send the spectator kit to every Live viewer (after Login /
@@ -664,7 +797,18 @@ impl Session {
     }
 
     fn on_attach(&mut self, id: ClientId, tx: mpsc::Sender<Frame>, username: String, uuid: Uuid) {
+        if let Some(max) = self.opts.max_clients {
+            if self.clients.len() >= max {
+                tracing::info!("refusing viewer {id} ('{username}'): max_clients={max} reached");
+                // dropping tx closes the writer and the socket
+                return;
+            }
+        }
         tracing::info!("viewer {id} ('{username}') attaching");
+        let _ = self.events.send(ProxyEvent::ClientJoined {
+            id,
+            username: username.clone(),
+        });
         self.clients.insert(
             id,
             ClientHandle {
@@ -673,6 +817,7 @@ impl Session {
                 username,
                 uuid,
                 swallow_next_accept: false,
+                camera_on: false,
             },
         );
         if self.cache.login.is_some() {
@@ -793,13 +938,34 @@ impl Session {
     fn drop_client(&mut self, id: ClientId, reason: &str) {
         if let Some(c) = self.clients.remove(&id) {
             tracing::info!("client {id} ('{}') dropped: {reason}", c.username);
+            let _ = self.events.send(ProxyEvent::ClientLeft {
+                id,
+                username: c.username,
+            });
             // dropping c.tx ends the writer task, which closes the socket
         }
         if self.controller == Some(id) {
+            self.controller = None;
+            if self.opts.always_first_control {
+                // the original's alwaysFirstControl: oldest live client
+                // inherits control immediately
+                let oldest = self
+                    .clients
+                    .iter()
+                    .filter(|(_, c)| matches!(c.state, ClientState::Live))
+                    .map(|(&cid, _)| cid)
+                    .min();
+                if let Some(next) = oldest {
+                    tracing::info!("controller left; promoting client {next} (always_first_control)");
+                    self.promote_to_controller(next);
+                    self.feedback(next, "previous controller left — you have control now");
+                    return;
+                }
+            }
             // session survives controllerless: stand_in() takes over
             // keepalives/teleports until someone runs ,acquire
-            self.controller = None;
             tracing::info!("controller left; session is now controllerless (use ,acquire)");
+            let _ = self.events.send(ProxyEvent::ControlChanged { controller: None });
         }
     }
 }
