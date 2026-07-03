@@ -1,6 +1,6 @@
 [package]
 name = "azalea-reflection-proxy"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Spectate and take over an azalea bot session live through a local reflection proxy — Rust port of mineflayer-reflection-proxy"
 license = "MIT"
