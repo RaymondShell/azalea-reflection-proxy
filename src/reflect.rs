@@ -124,6 +124,22 @@ pub fn controller_kit(uuid: Uuid, name: &str, real_mode: u8) -> Vec<Frame> {
     ]
 }
 
+/// Lock a client's camera to an entity (the `,spectate` command). Send
+/// with the client's own player id to detach.
+pub fn camera_frame(entity_id: i32) -> Frame {
+    use azalea_protocol::packets::game::c_set_camera::ClientboundSetCamera;
+    frame_of(ClientboundSetCamera {
+        camera_id: MinecraftEntityId(entity_id),
+    })
+}
+
+/// Client-side game mode change for one client (the `,gamemode`
+/// command): own-uuid player info + the game event, same pair the
+/// spectator kit uses.
+pub fn gamemode_kit(uuid: Uuid, name: &str, mode: u8) -> Vec<Frame> {
+    vec![own_info_frame(uuid, name, mode), gamemode_event_frame(mode)]
+}
+
 /// Despawn the reflected bot entity (for a client becoming controller —
 /// it must not see a ghost of itself).
 pub fn remove_reflected_frame() -> Frame {

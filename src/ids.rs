@@ -40,6 +40,7 @@ pub const CB_GAME_REMOVE_MOB_EFFECT: u32 = 78;
 pub const CB_GAME_RESET_SCORE: u32 = 79;
 pub const CB_GAME_RESPAWN: u32 = 82;
 pub const CB_GAME_ROTATE_HEAD: u32 = 83;
+pub const CB_GAME_SET_CAMERA: u32 = 93;
 pub const CB_GAME_SET_CHUNK_CACHE_CENTER: u32 = 94;
 pub const CB_GAME_SET_CHUNK_CACHE_RADIUS: u32 = 95;
 pub const CB_GAME_SET_DEFAULT_SPAWN_POSITION: u32 = 97;
@@ -422,6 +423,13 @@ mod tests {
             SB_GAME_ACCEPT_TELEPORTATION
         );
         assert_eq!(ServerboundKeepAlive { id: 0 }.into_variant().id(), 28);
+        {
+            use azalea_protocol::packets::game::c_set_camera::ClientboundSetCamera;
+            assert_eq!(
+                ClientboundSetCamera { camera_id: eid }.into_variant().id(),
+                CB_GAME_SET_CAMERA
+            );
+        }
     }
 
     fn info_packet(
