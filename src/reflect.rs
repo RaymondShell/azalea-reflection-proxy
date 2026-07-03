@@ -356,6 +356,25 @@ pub fn apply_controller_move(pose: &mut BotPose, frame: &Frame) -> bool {
     true
 }
 
+/// Serverbound idle position report at the current pose. A vanilla
+/// client tells the server where it is at least once a second even when
+/// standing still; while the session is controllerless nobody does that,
+/// and Hypixel-style servers treat the silent movement stream as a dead
+/// connection ("Out of sync, check your internet connection!") and dump
+/// the player to Limbo. The stand-in sends this heartbeat instead.
+pub fn idle_move_frame(pose: &BotPose) -> Option<Frame> {
+    use azalea_protocol::common::movements::MoveFlags;
+    use azalea_protocol::packets::game::s_move_player_pos_rot::ServerboundMovePlayerPosRot;
+    Some(frame_of(ServerboundMovePlayerPosRot {
+        pos: pose.pos?,
+        look_direction: pose.look,
+        flags: MoveFlags {
+            on_ground: pose.on_ground,
+            horizontal_collision: false,
+        },
+    }))
+}
+
 /// Update the pose from a clientbound PlayerPosition (server teleport of
 /// the controlled player). Only absolute teleports are applied — the
 /// relative-flag math isn't worth modelling here, and the controller's

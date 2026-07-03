@@ -60,6 +60,9 @@ pub enum SessionMsg {
         uuid: Uuid,
     },
     Detach(ClientId),
+    /// Once-a-second timer: while controllerless, the stand-in must
+    /// report the player's position like an idle client would.
+    StandInTick,
 }
 
 enum ClientState {
@@ -242,6 +245,18 @@ pub fn spawn(
         opts,
         events,
     };
+    // drive the stand-in heartbeat; ends when the session drops msg_rx
+    let tick_tx = msg_tx.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            ticker.tick().await;
+            if tick_tx.send(SessionMsg::StandInTick).await.is_err() {
+                break;
+            }
+        }
+    });
+
     tokio::spawn(session.run(msg_rx));
     msg_tx
 }
@@ -379,6 +394,7 @@ impl Session {
                     uuid,
                 } => self.on_attach(id, tx, username, uuid),
                 SessionMsg::Detach(id) => self.drop_client(id, "disconnected"),
+                SessionMsg::StandInTick => self.stand_in_tick().await,
             }
             if self.clients.is_empty() {
                 tracing::info!("last client left; tearing session down");
@@ -434,6 +450,23 @@ impl Session {
             if self.upstream_tx.send(r).await.is_err() {
                 tracing::warn!("stand-in reply failed: upstream writer closed");
             }
+        }
+    }
+
+    /// Controllerless position heartbeat. An idle vanilla client still
+    /// reports its position every second; without this, Hypixel treats
+    /// the silent movement stream as a broken connection ("Out of sync,
+    /// check your internet connection!") and dumps the player to Limbo
+    /// ~15s after the controller releases or disconnects.
+    async fn stand_in_tick(&mut self) {
+        if self.controller.is_some() || !matches!(self.upstream_state, UpstreamState::Game) {
+            return;
+        }
+        let Some(f) = reflect::idle_move_frame(&self.pose) else {
+            return; // pose unknown until the first teleport lands
+        };
+        if self.upstream_tx.send(f).await.is_err() {
+            tracing::warn!("stand-in heartbeat failed: upstream writer closed");
         }
     }
 
@@ -552,7 +585,14 @@ impl Session {
                 && matches!(self.upstream_state, UpstreamState::Game)
             {
                 if let Some(c) = self.clients.get_mut(&id) {
-                    if c.swallow_next_accept {
+                    // only the accept whose id matches the synthesized
+                    // handoff teleport is swallowed. A real server teleport
+                    // can race the handoff; blindly eating the NEXT accept
+                    // would forward the handoff id (garbage to the server)
+                    // and drop the real confirm — instant desync.
+                    if c.swallow_next_accept
+                        && reflect::teleport_id(&frame) == Some(reflect::HANDOFF_TELEPORT_ID)
+                    {
                         c.swallow_next_accept = false;
                         return Ok(());
                     }
