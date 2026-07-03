@@ -21,11 +21,11 @@ Microsoft auth now (same azalea-auth token cache).
 
 ## Usage as a library (the intended way)
 
-Add the crate to your bot (path dependency until published):
+Add the crate to your bot:
 
 ```toml
 [dependencies]
-azalea-reflection-proxy = { path = "../azalea-reflection-proxy" }
+azalea-reflection-proxy = "0.1.0"
 ```
 
 Then spawn the proxy in-process and point your azalea bot at it — two
