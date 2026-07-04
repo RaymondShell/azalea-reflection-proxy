@@ -160,6 +160,22 @@ pub fn gamemode_kit(uuid: Uuid, name: &str, mode: u8) -> Vec<Frame> {
     vec![own_info_frame(uuid, name, mode), gamemode_event_frame(mode)]
 }
 
+/// Full (re)spawn of the reflected bot for a viewer, in the order the
+/// client requires: remove any previous copy, (re)add the bot's
+/// player-info (a Login/Respawn clears the tab list, and the client
+/// refuses to render a player entity with no matching profile), then
+/// spawn the entity. Idempotent — safe whether or not the client
+/// already has the entity, so re-sending it across lobby switches can
+/// never produce a "Duplicate entity UUID" for the reflected bot.
+pub fn reflected_bundle(bot_uuid: Uuid, bot_name: &str, pose: &BotPose) -> Vec<Frame> {
+    let mut v = vec![
+        remove_reflected_frame(),
+        bot_info_frame(bot_uuid, bot_name),
+    ];
+    v.extend(spawn_frames(bot_uuid, pose));
+    v
+}
+
 /// Despawn the reflected bot entity (for a client becoming controller —
 /// it must not see a ghost of itself).
 pub fn remove_reflected_frame() -> Frame {

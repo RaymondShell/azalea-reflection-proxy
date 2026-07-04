@@ -29,6 +29,12 @@ const MAX_SLOT_FRAMES: usize = 64;
 
 #[derive(Default)]
 pub struct WorldSnapshot {
+    /// The bot's own uuid. The proxy shows the bot to viewers as the
+    /// synthesized reflected entity, so any REAL entity the server sends
+    /// carrying this uuid (some servers echo the player's own body) must
+    /// be dropped, or it collides with the reflected entity as a
+    /// "Duplicate entity UUID".
+    bot_uuid: Option<Uuid>,
     entities: HashMap<i32, EntityRecord>,
     /// Merged tab-list entries by uuid.
     players: HashMap<Uuid, PlayerInfoEntry>,
@@ -123,6 +129,13 @@ fn degrees(compact: i8) -> f32 {
 }
 
 impl WorldSnapshot {
+    /// Record the bot's own uuid so its real entity (if the server ever
+    /// echoes it) is never stored, keeping it from colliding with the
+    /// reflected entity on a viewer's client.
+    pub fn set_bot_uuid(&mut self, uuid: Uuid) {
+        self.bot_uuid = Some(uuid);
+    }
+
     /// Dimension change: world entities and weather are gone, but the
     /// player list, scoreboards, inventory and vitals persist.
     pub fn on_respawn(&mut self) {
@@ -143,6 +156,12 @@ impl WorldSnapshot {
         match f.packet_id {
             ids::CB_GAME_ADD_ENTITY => {
                 if let Some(ClientboundGamePacket::AddEntity(p)) = typed(f) {
+                    // never store the bot's own body — the reflected entity
+                    // represents it, and a second entity with the same uuid
+                    // is a "Duplicate entity UUID" on the viewer
+                    if self.bot_uuid == Some(p.uuid) {
+                        return;
+                    }
                     self.entities.insert(
                         p.id.0,
                         EntityRecord {
@@ -645,6 +664,52 @@ mod tests {
             }
             other => panic!("expected Add, got {other:?}"),
         }
+    }
+
+    /// The bot's own body must never enter the snapshot: the reflected
+    /// entity represents it, so a real one with the same uuid would be a
+    /// "Duplicate entity UUID" on the viewer.
+    #[test]
+    fn snapshot_skips_bot_own_entity() {
+        use azalea_core::delta::LpVec3;
+        use azalea_core::entity_id::MinecraftEntityId;
+        use azalea_core::position::Vec3;
+        use azalea_protocol::packets::game::c_add_entity::ClientboundAddEntity;
+        use azalea_registry::builtin::EntityKind;
+
+        let bot = Uuid::from_u128(0xB07);
+        let other = Uuid::from_u128(0x07);
+        let add = |id: i32, uuid: Uuid| {
+            frame_of(ClientboundAddEntity {
+                id: MinecraftEntityId(id),
+                uuid,
+                entity_type: EntityKind::Player,
+                position: Vec3::default(),
+                movement: LpVec3::Zero,
+                x_rot: 0,
+                y_rot: 0,
+                y_head_rot: 0,
+                data: 0,
+            })
+        };
+
+        let mut snap = WorldSnapshot::default();
+        snap.set_bot_uuid(bot);
+        snap.observe(&add(5, bot)); // skipped
+        snap.observe(&add(6, other)); // kept
+
+        let uuids: Vec<Uuid> = snap
+            .replay()
+            .into_iter()
+            .filter_map(|f| {
+                match ClientboundGamePacket::read(f.packet_id, &mut Cursor::new(&f.body[..])) {
+                    Ok(ClientboundGamePacket::AddEntity(a)) => Some(a.uuid),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert!(!uuids.contains(&bot));
+        assert!(uuids.contains(&other));
     }
 
     #[test]

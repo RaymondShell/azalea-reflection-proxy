@@ -226,12 +226,14 @@ pub fn spawn(
         controller: Some((controller_id, controller.username.clone())),
     });
 
+    let mut cache = JoinCache::default();
+    cache.world.set_bot_uuid(bot_uuid);
     let session = Session {
         pipeline,
         upstream_tx,
         clients,
         controller: Some(controller_id),
-        cache: JoinCache::default(),
+        cache,
         upstream_state: UpstreamState::Config,
         seen_first_game_frame: false,
         bot_uuid,
@@ -603,14 +605,12 @@ impl Session {
             if reflect::apply_controller_move(&mut self.pose, &frame) {
                 let update = if self.respawn_entity_pending && self.pose.pos.is_some() {
                     self.respawn_entity_pending = false;
-                    // Re-send the bot's player-info first: a Login/Respawn
-                    // (e.g. a Hypixel lobby switch) clears the client's tab
-                    // list, so spawning the reflected player entity without
-                    // re-adding its profile makes the client log "add player
-                    // prior to sending player info" and drop the entity.
-                    let mut v = vec![reflect::bot_info_frame(self.bot_uuid, &self.bot_name)];
-                    v.extend(reflect::spawn_frames(self.bot_uuid, &self.pose));
-                    v
+                    // Idempotent re-spawn: clear any previous copy, re-add
+                    // the bot's profile (a Login/Respawn lobby switch clears
+                    // the tab list), then spawn — otherwise the client logs
+                    // "add player prior to player info" or "Duplicate entity
+                    // UUID" for the reflected bot.
+                    reflect::reflected_bundle(self.bot_uuid, &self.bot_name, &self.pose)
                 } else {
                     reflect::move_frames(&self.pose)
                 };
@@ -637,8 +637,7 @@ impl Session {
                 (c.uuid, c.username.clone())
             };
             queue.extend(reflect::spectator_kit(uuid, &name));
-            queue.push(reflect::bot_info_frame(self.bot_uuid, &self.bot_name));
-            queue.extend(reflect::spawn_frames(self.bot_uuid, &self.pose));
+            queue.extend(reflect::reflected_bundle(self.bot_uuid, &self.bot_name, &self.pose));
             let c = self.clients.get_mut(&id).expect("checked above");
             let mut ok = true;
             for f in queue {
@@ -806,8 +805,7 @@ impl Session {
             return;
         };
         let mut frames = reflect::spectator_kit(c.uuid, &c.username);
-        frames.push(reflect::bot_info_frame(self.bot_uuid, &self.bot_name));
-        frames.extend(reflect::spawn_frames(self.bot_uuid, &self.pose));
+        frames.extend(reflect::reflected_bundle(self.bot_uuid, &self.bot_name, &self.pose));
         let c = self.clients.get(&id).expect("checked above");
         for f in frames {
             let _ = c.tx.try_send(f);
