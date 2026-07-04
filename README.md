@@ -112,8 +112,12 @@ tokio::spawn(async move {
   feet loads.
 - World snapshot (`snapshot.rs`) — the snapshot.js port: entities (with
   positions accumulated from relative moves), tab list (merged
-  player-info entries), scoreboards/teams, player inventory,
-  health/food/xp, time, held slot and weather, cached as raw frames.
+  player-info entries), scoreboards/teams, player inventory (both the
+  container-0 packets and the 1.21.2+ per-slot `set_player_inventory`),
+  health/food/xp, time, held slot, weather, and boss bars (accumulated
+  per uuid and replayed as a synthesized `Add`, so a viewer joining
+  mid-fight doesn't crash on the next boss-bar update). Cached as raw
+  frames and replayed to mid-session joiners.
 - Spectator viewers (`reflect.rs`) — viewers get the full spectator kit
   on join (own-uuid player info + game event + abilities — modern
   clients key game mode off the player-info entry, so the event alone
@@ -149,12 +153,14 @@ parses that one packet.
 
 ## Status
 
-Everything above is implemented; the passthrough and replicator paths
-(bot through proxy, viewer join, terrain + spectator mode) have been
-tested live. The newer surfaces — control handoff, `,spectate` camera,
-events, whitelist/max_clients — have unit-test coverage but no live
-mileage yet. Treat `,acquire` with care on anticheat-guarded servers:
-position is aligned on handoff, but momentum is not carried over.
+Everything above is implemented. The passthrough and replicator paths
+(bot through proxy, viewer join, terrain), spectator mode, and
+`,spectate` with the bot's HUD have been tested live — hardening the
+mid-session join (modern inventory sync, boss-bar replay) came directly
+out of that testing. Control handoff, the event stream, and
+whitelist/max_clients have unit-test coverage but little live mileage
+yet. Treat `,acquire` with care on anticheat-guarded servers: position
+is aligned on handoff, but momentum is not carried over.
 
 ## What is NOT ported (and why)
 
