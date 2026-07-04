@@ -20,6 +20,7 @@ pub const SB_CONFIG_FINISH: u32 = 3;
 
 // game, clientbound
 pub const CB_GAME_ADD_ENTITY: u32 = 1;
+pub const CB_GAME_BOSS_EVENT: u32 = 9;
 pub const CB_GAME_CONTAINER_SET_CONTENT: u32 = 18;
 pub const CB_GAME_CONTAINER_SET_SLOT: u32 = 20;
 pub const CB_GAME_ENTITY_POSITION_SYNC: u32 = 35;
@@ -272,6 +273,7 @@ mod tests {
             c_remove_entities::ClientboundRemoveEntities,
             c_reset_score::ClientboundResetScore,
             c_rotate_head::ClientboundRotateHead,
+            c_boss_event::{ClientboundBossEvent, Operation},
             c_set_health::ClientboundSetHealth,
             c_set_player_inventory::ClientboundSetPlayerInventory,
             c_system_chat::ClientboundSystemChat,
@@ -408,6 +410,15 @@ mod tests {
             .into_variant()
             .id(),
             CB_GAME_SET_PLAYER_INVENTORY
+        );
+        assert_eq!(
+            ClientboundBossEvent {
+                id: Uuid::nil(),
+                operation: Operation::Remove,
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_BOSS_EVENT
         );
         assert_eq!(
             ClientboundSystemChat {

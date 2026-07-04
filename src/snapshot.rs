@@ -52,6 +52,20 @@ pub struct WorldSnapshot {
     rain: Option<Frame>,
     rain_level: Option<Frame>,
     thunder_level: Option<Frame>,
+    /// Active boss bars by uuid, accumulated from their Add/Update
+    /// operations. A viewer joining mid-fight never saw the original
+    /// Add, so a later Update* (e.g. UpdateName) for an unknown bar
+    /// makes the vanilla client dereference a null map entry and
+    /// disconnect — we replay a synthesized Add for each on join.
+    boss_bars: HashMap<Uuid, BossBar>,
+}
+
+/// Accumulated state of one boss bar, enough to rebuild its Add.
+struct BossBar {
+    name: azalea_chat::FormattedText,
+    progress: f32,
+    style: azalea_protocol::packets::game::c_boss_event::Style,
+    properties: azalea_protocol::packets::game::c_boss_event::Properties,
 }
 
 struct EntityRecord {
@@ -343,6 +357,50 @@ impl WorldSnapshot {
                     self.player_inventory.insert(slot, f.clone());
                 }
             }
+            ids::CB_GAME_BOSS_EVENT => {
+                use azalea_protocol::packets::game::c_boss_event::Operation;
+                if let Some(ClientboundGamePacket::BossEvent(p)) = typed(f) {
+                    match p.operation {
+                        Operation::Add(a) => {
+                            self.boss_bars.insert(
+                                p.id,
+                                BossBar {
+                                    name: a.name,
+                                    progress: a.progress,
+                                    style: a.style,
+                                    properties: a.properties,
+                                },
+                            );
+                        }
+                        Operation::Remove => {
+                            self.boss_bars.remove(&p.id);
+                        }
+                        // Updates only mutate a bar we already Added; a bar
+                        // the proxy never saw Added can't be reconstructed
+                        // (Add carries required style/properties), so ignore.
+                        Operation::UpdateProgress(v) => {
+                            if let Some(b) = self.boss_bars.get_mut(&p.id) {
+                                b.progress = v;
+                            }
+                        }
+                        Operation::UpdateName(n) => {
+                            if let Some(b) = self.boss_bars.get_mut(&p.id) {
+                                b.name = n;
+                            }
+                        }
+                        Operation::UpdateStyle(s) => {
+                            if let Some(b) = self.boss_bars.get_mut(&p.id) {
+                                b.style = s;
+                            }
+                        }
+                        Operation::UpdateProperties(pr) => {
+                            if let Some(b) = self.boss_bars.get_mut(&p.id) {
+                                b.properties = pr;
+                            }
+                        }
+                    }
+                }
+            }
             ids::CB_GAME_GAME_EVENT => match f.body.first() {
                 // 1 = start rain, 2 = stop rain: latest wins either way
                 Some(&1) | Some(&2) => self.rain = Some(f.clone()),
@@ -438,6 +496,20 @@ impl WorldSnapshot {
             q.extend(frames.iter().cloned());
         }
         q.extend(self.tab_list.iter().cloned());
+        for (id, b) in &self.boss_bars {
+            use azalea_protocol::packets::game::c_boss_event::{
+                AddOperation, ClientboundBossEvent, Operation,
+            };
+            q.push(frame_of(ClientboundBossEvent {
+                id: *id,
+                operation: Operation::Add(AddOperation {
+                    name: b.name.clone(),
+                    progress: b.progress,
+                    style: b.style.clone(),
+                    properties: b.properties.clone(),
+                }),
+            }));
+        }
         q.extend(self.rain.iter().cloned());
         q.extend(self.rain_level.iter().cloned());
         q.extend(self.thunder_level.iter().cloned());
@@ -459,5 +531,104 @@ impl WorldSnapshot {
         q.extend(self.health.iter().cloned());
         q.extend(self.experience.iter().cloned());
         q
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use azalea_chat::FormattedText;
+    use azalea_protocol::packets::game::c_boss_event::{
+        AddOperation, BossBarColor, BossBarOverlay, ClientboundBossEvent, Operation, Properties,
+        Style,
+    };
+    use azalea_protocol::packets::game::ClientboundGamePacket;
+    use azalea_protocol::packets::ProtocolPacket;
+    use std::io::Cursor;
+
+    fn boss_frame(id: Uuid, operation: Operation) -> Frame {
+        frame_of(ClientboundBossEvent { id, operation })
+    }
+
+    fn add_op(name: &str) -> Operation {
+        Operation::Add(AddOperation {
+            name: FormattedText::from(name),
+            progress: 1.0,
+            style: Style {
+                color: BossBarColor::Purple,
+                overlay: BossBarOverlay::Progress,
+            },
+            properties: Properties {
+                darken_screen: false,
+                play_music: false,
+                create_world_fog: false,
+            },
+        })
+    }
+
+    /// A viewer that missed the Add must still get one on join, carrying
+    /// the latest name from subsequent Update operations — the exact gap
+    /// that NPE-crashed the client on a bare UpdateName.
+    #[test]
+    fn boss_bar_add_then_update_replays_as_add() {
+        let id = Uuid::from_u128(7);
+        let mut snap = WorldSnapshot::default();
+        snap.observe(&boss_frame(id, add_op("Wither")));
+        snap.observe(&boss_frame(id, Operation::UpdateName(FormattedText::from("Ender Dragon"))));
+        snap.observe(&boss_frame(id, Operation::UpdateProgress(0.5)));
+
+        let bars: Vec<_> = snap
+            .replay()
+            .into_iter()
+            .filter_map(|f| {
+                match ClientboundGamePacket::read(f.packet_id, &mut Cursor::new(&f.body[..])) {
+                    Ok(ClientboundGamePacket::BossEvent(b)) => Some(b),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].id, id);
+        match &bars[0].operation {
+            Operation::Add(a) => {
+                assert_eq!(a.name, FormattedText::from("Ender Dragon"));
+                assert_eq!(a.progress, 0.5);
+            }
+            other => panic!("expected Add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn boss_bar_remove_drops_it() {
+        let id = Uuid::from_u128(9);
+        let mut snap = WorldSnapshot::default();
+        snap.observe(&boss_frame(id, add_op("Boss")));
+        snap.observe(&boss_frame(id, Operation::Remove));
+        let has_boss = snap.replay().into_iter().any(|f| {
+            matches!(
+                ClientboundGamePacket::read(f.packet_id, &mut Cursor::new(&f.body[..])),
+                Ok(ClientboundGamePacket::BossEvent(_))
+            )
+        });
+        assert!(!has_boss);
+    }
+
+    /// An Update for a bar the proxy never saw Added can't be rebuilt
+    /// (Add carries required style/properties), so it is ignored rather
+    /// than replayed as a broken bar.
+    #[test]
+    fn boss_bar_orphan_update_is_ignored() {
+        let mut snap = WorldSnapshot::default();
+        snap.observe(&boss_frame(
+            Uuid::from_u128(1),
+            Operation::UpdateName(FormattedText::from("ghost")),
+        ));
+        let has_boss = snap.replay().into_iter().any(|f| {
+            matches!(
+                ClientboundGamePacket::read(f.packet_id, &mut Cursor::new(&f.body[..])),
+                Ok(ClientboundGamePacket::BossEvent(_))
+            )
+        });
+        assert!(!has_boss);
     }
 }
