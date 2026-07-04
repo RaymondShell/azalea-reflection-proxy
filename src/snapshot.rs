@@ -282,13 +282,45 @@ impl WorldSnapshot {
                 }
             }
             ids::CB_GAME_SET_OBJECTIVE => {
-                use azalea_protocol::packets::game::c_set_objective::Method;
+                use azalea_protocol::packets::game::c_set_objective::{
+                    ClientboundSetObjective, Method,
+                };
                 if let Some(ClientboundGamePacket::SetObjective(p)) = typed(f) {
-                    if matches!(p.method, Method::Remove) {
-                        self.objectives.remove(&p.objective_name);
-                        self.scores.retain(|(obj, _), _| obj != &p.objective_name);
-                    } else {
-                        self.objectives.insert(p.objective_name, f.clone());
+                    match p.method {
+                        Method::Remove => {
+                            self.objectives.remove(&p.objective_name);
+                            self.scores.retain(|(obj, _), _| obj != &p.objective_name);
+                        }
+                        // Store every objective as an Add. A mid-session
+                        // viewer needs the Add to CREATE the objective; a
+                        // Change on an objective a fresh client doesn't have
+                        // is silently dropped, after which every score and
+                        // display for it warns "unknown scoreboard
+                        // objective". Servers with animated sidebar titles
+                        // (Hypixel) send a stream of Change ops, so the last
+                        // stored frame is almost always a Change — hence the
+                        // normalization. Add and Change carry identical
+                        // payloads, so this is lossless.
+                        Method::Add {
+                            display_name,
+                            render_type,
+                            number_format,
+                        }
+                        | Method::Change {
+                            display_name,
+                            render_type,
+                            number_format,
+                        } => {
+                            let add = frame_of(ClientboundSetObjective {
+                                objective_name: p.objective_name.clone(),
+                                method: Method::Add {
+                                    display_name,
+                                    render_type,
+                                    number_format,
+                                },
+                            });
+                            self.objectives.insert(p.objective_name, add);
+                        }
                     }
                 }
             }
@@ -611,6 +643,60 @@ mod tests {
             )
         });
         assert!(!has_boss);
+    }
+
+    /// A viewer that missed the objective's Add and only sees a stream
+    /// of Change ops (animated sidebar titles) must still get an Add on
+    /// join, or every score/display for it warns "unknown objective".
+    #[test]
+    fn objective_change_replays_as_add() {
+        use azalea_chat::numbers::NumberFormat;
+        use azalea_core::objectives::ObjectiveCriteria;
+        use azalea_protocol::packets::game::c_set_objective::{
+            ClientboundSetObjective, Method,
+        };
+
+        let obj = |name: &str, method| {
+            frame_of(ClientboundSetObjective {
+                objective_name: name.to_string(),
+                method,
+            })
+        };
+        let params = || Method::Add {
+            display_name: FormattedText::from("Title"),
+            render_type: ObjectiveCriteria::Integer,
+            number_format: NumberFormat::Blank,
+        };
+        let change = || Method::Change {
+            display_name: FormattedText::from("Title v2"),
+            render_type: ObjectiveCriteria::Integer,
+            number_format: NumberFormat::Blank,
+        };
+
+        let mut snap = WorldSnapshot::default();
+        snap.observe(&obj("SBScoreboard", params()));
+        snap.observe(&obj("SBScoreboard", change())); // title tick
+
+        let objectives: Vec<_> = snap
+            .replay()
+            .into_iter()
+            .filter_map(|f| {
+                match ClientboundGamePacket::read(f.packet_id, &mut Cursor::new(&f.body[..])) {
+                    Ok(ClientboundGamePacket::SetObjective(o)) => Some(o),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(objectives.len(), 1);
+        assert_eq!(objectives[0].objective_name, "SBScoreboard");
+        // the replayed frame must be an Add (creates the objective),
+        // carrying the latest title
+        match &objectives[0].method {
+            Method::Add { display_name, .. } => {
+                assert_eq!(display_name, &FormattedText::from("Title v2"));
+            }
+            other => panic!("expected Add, got {other:?}"),
+        }
     }
 
     /// An Update for a bar the proxy never saw Added can't be rebuilt
