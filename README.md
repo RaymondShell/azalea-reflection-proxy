@@ -63,11 +63,16 @@ env vars) wraps the same builder.
   teleport confirms itself so the session stays alive with nobody
   driving (unless `always_first_control` is on, in which case the
   oldest viewer inherits control)
-- `,spectate [username]` — lock the camera to a player entity **and**
-  show the bot's HUD (inventory, held item, health/hunger, xp) — the
-  same on-screen UI `,acquire` gives you, without taking control. No
-  arg = the reflected bot; repeat with no arg to drop back to a
-  free-flying spectator. Viewers only.
+- `,spectate [username]` — with no arg (or the bot's name), **ride
+  along** with the bot: you're glued to its position seeing what it
+  sees, **with** its full HUD (inventory, held item, health/hunger,
+  xp) — the same on-screen UI `,acquire` gives, without taking
+  control. Repeat with no arg to drop back to a free-flying spectator.
+  With another player's name, locks the camera to them (spectator
+  mode, no HUD). Viewers only. (A true camera-lock and the HUD can't
+  coexist on the client — spectator mode is required for `SetCamera`
+  but hides the HUD — so the ride-along teleports you to the bot each
+  tick instead, which gives both.)
 - `,gamemode <survival|creative|adventure|spectator|0-3>` —
   client-side game mode for the issuing viewer
 

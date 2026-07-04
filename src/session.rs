@@ -76,6 +76,21 @@ enum ClientState {
     Live,
 }
 
+/// How a viewer is currently watching. Default is a plain free-flying
+/// spectator.
+#[derive(Clone, Copy, PartialEq)]
+enum Spectate {
+    /// Free-flying spectator, camera on self, reflected bot visible.
+    Off,
+    /// Ride-along the bot: in the bot's game mode (so the HUD shows),
+    /// reflected entity hidden, teleport-locked to the bot's position
+    /// with free look. The "best of both worlds" mode.
+    Ride,
+    /// Spectator with the camera locked to another entity (the
+    /// `,spectate <player>` case — no HUD, but you see through them).
+    Camera(i32),
+}
+
 struct ClientHandle {
     tx: mpsc::Sender<Frame>,
     state: ClientState,
@@ -84,8 +99,8 @@ struct ClientHandle {
     /// Swallow the accept for a proxy-synthesized handoff teleport so it
     /// never reaches the server.
     swallow_next_accept: bool,
-    /// `,spectate` camera lock currently active for this viewer.
-    camera_on: bool,
+    /// How this viewer is currently spectating.
+    spectate: Spectate,
 }
 
 /// Join cache: config replay + world state a late viewer needs. Chunks
@@ -212,7 +227,7 @@ pub fn spawn(
             username: controller.username.clone(),
             uuid: controller.uuid,
             swallow_next_accept: false,
-            camera_on: false,
+            spectate: Spectate::Off,
         },
     );
     start_client_io(controller_id, controller.connection, msg_tx.clone(), ctl_rx);
@@ -600,8 +615,9 @@ impl Session {
                     }
                 }
             }
-            // mirror the bot's movement onto the reflected entity before
-            // the frame moves on
+            // mirror the bot's movement before the frame moves on: to
+            // ordinary spectators as the reflected entity, to ride-along
+            // spectators as a teleport that glues them to the bot.
             if reflect::apply_controller_move(&mut self.pose, &frame) {
                 let update = if self.respawn_entity_pending && self.pose.pos.is_some() {
                     self.respawn_entity_pending = false;
@@ -614,7 +630,8 @@ impl Session {
                 } else {
                     reflect::move_frames(&self.pose)
                 };
-                self.send_to_viewers(&update);
+                let follow = reflect::follow_teleport_frame(&self.pose);
+                self.send_bot_movement(&update, follow.as_ref());
             }
             for f in self.pipeline.serverbound(frame) {
                 if self.upstream_tx.send(f).await.is_err() {
@@ -699,73 +716,91 @@ impl Session {
         Ok(())
     }
 
-    /// `,spectate [username]` — lock the camera to a player entity and
-    /// show the bot's HUD (inventory, held item, health/hunger, xp), the
-    /// same on-screen UI `,acquire` gives you, without taking control.
-    /// No arg targets the reflected bot; repeat with no arg to drop back
-    /// to a free-flying spectator.
+    /// `,spectate [username]` — with no arg (or the bot's name), toggle
+    /// the ride-along: you're glued to the bot with its full HUD
+    /// (inventory, held item, health/hunger, xp) and free look — the
+    /// same on-screen UI `,acquire` gives, without taking control. With
+    /// another player's name, lock the camera to them in spectator mode
+    /// (no HUD, but you see through their eyes).
     fn cmd_spectate(&mut self, id: ClientId, arg: &str) {
         if Some(id) == self.controller {
             self.feedback(id, ",release first — the controller cannot spectate");
             return;
         }
-        let (uuid, name, camera_on) = match self.clients.get(&id) {
-            Some(c) => (c.uuid, c.username.clone(), c.camera_on),
+        let current = match self.clients.get(&id) {
+            Some(c) => c.spectate,
             None => return,
         };
-        let (target, turning_on) = if arg.is_empty() {
-            if camera_on {
-                // toggle off: back to the viewer's own client entity
-                let Some(own) = self.real_player_id else {
-                    self.feedback(id, "cannot detach camera yet (no login seen)");
-                    return;
-                };
-                (own, false)
+        let target = if arg.is_empty() {
+            // toggle the ride-along
+            if current == Spectate::Off {
+                Spectate::Ride
             } else {
-                (reflect::REFLECTED_ENTITY_ID, true)
+                Spectate::Off
             }
         } else if arg.eq_ignore_ascii_case(&self.bot_name) {
-            (reflect::REFLECTED_ENTITY_ID, true)
+            Spectate::Ride
         } else {
             match self.cache.world.entity_id_for_player(arg) {
-                Some(eid) => (eid, true),
+                Some(eid) => Spectate::Camera(eid),
                 None => {
                     self.feedback(id, "player not found (not in render distance?)");
                     return;
                 }
             }
         };
+        self.apply_spectate(id, target);
+        self.feedback(
+            id,
+            match target {
+                Spectate::Ride => {
+                    "riding along with the bot, HUD shown — ,spectate again to free-look"
+                }
+                Spectate::Camera(_) => "camera locked to that player — ,spectate to return",
+                Spectate::Off => "back to free-look spectator",
+            },
+        );
+    }
 
-        // Build the packet burst before touching the client, so the
-        // snapshot borrow and the client borrow don't overlap.
+    /// Send the frames that put a viewer into a spectate state and record
+    /// it. Each state's frame set is self-contained (game mode + camera +
+    /// reflected-entity visibility), so this doubles as the re-assert
+    /// after a Login/Respawn resets the client.
+    fn apply_spectate(&mut self, id: ClientId, target: Spectate) {
+        let (uuid, name) = match self.clients.get(&id) {
+            Some(c) => (c.uuid, c.username.clone()),
+            None => return,
+        };
         let mut frames = Vec::new();
-        if turning_on {
-            // Spectator game mode hides the whole HUD, so switch to the
-            // bot's real game mode (+ flight, so swallowed inputs don't
-            // drop the viewer), repopulate inventory/vitals from the
-            // snapshot, then lock the camera to the target.
-            frames.extend(reflect::spectate_hud_kit(uuid, &name, self.real_game_mode));
-            frames.extend(self.cache.world.self_hud_frames());
-            frames.push(reflect::camera_frame(target));
-        } else {
-            // Back to a free-flying spectator with the camera on self.
-            frames.extend(reflect::spectator_kit(uuid, &name));
-            frames.push(reflect::camera_frame(target));
+        match target {
+            Spectate::Off => {
+                frames.extend(reflect::spectator_kit(uuid, &name));
+                frames.extend(reflect::reflected_bundle(self.bot_uuid, &self.bot_name, &self.pose));
+                if let Some(own) = self.real_player_id {
+                    frames.push(reflect::camera_frame(own)); // detach any camera
+                }
+            }
+            Spectate::Ride => {
+                // bot's game mode + flight so the HUD renders, repopulate
+                // inventory/vitals, hide the reflected bot (we sit at its
+                // feet), then glue to its position.
+                frames.extend(reflect::spectate_hud_kit(uuid, &name, self.real_game_mode));
+                frames.extend(self.cache.world.self_hud_frames());
+                frames.push(reflect::remove_reflected_frame());
+                frames.extend(reflect::follow_teleport_frame(&self.pose));
+            }
+            Spectate::Camera(eid) => {
+                frames.extend(reflect::spectator_kit(uuid, &name));
+                frames.extend(reflect::reflected_bundle(self.bot_uuid, &self.bot_name, &self.pose));
+                frames.push(reflect::camera_frame(eid));
+            }
         }
         if let Some(c) = self.clients.get_mut(&id) {
             for f in frames {
                 let _ = c.tx.try_send(f);
             }
-            c.camera_on = turning_on;
+            c.spectate = target;
         }
-        self.feedback(
-            id,
-            if turning_on {
-                "spectating with the bot's HUD — ,spectate again to free-look"
-            } else {
-                "camera detached"
-            },
-        );
     }
 
     /// `,gamemode <0-3|name>` — client-side game mode for the issuing
@@ -829,7 +864,7 @@ impl Session {
         }
         if let Some(c) = self.clients.get_mut(&id) {
             c.swallow_next_accept = has_teleport;
-            c.camera_on = false; // controller drives its own camera
+            c.spectate = Spectate::Off; // controller drives its own camera
         }
         self.controller = Some(id);
         let username = self
@@ -842,28 +877,29 @@ impl Session {
         });
     }
 
-    /// Re-send the spectator kit to every Live viewer (after Login /
-    /// Respawn broadcasts, which reset client game modes). A Login or
-    /// Respawn also resets the client's camera to its own entity, so any
-    /// HUD-spectate camera lock is gone: clear `camera_on` here so state
-    /// matches, and the viewer can re-issue `,spectate`.
+    /// Re-establish every Live viewer's spectate state after a Login /
+    /// Respawn (which resets the client's game mode and camera). A
+    /// `Camera` lock targets an entity that a dimension change
+    /// despawned, so those fall back to a free-look spectator; `Ride`
+    /// and `Off` re-apply as-is (the ride-along is re-glued on the next
+    /// bot move).
     fn reassert_spectators(&mut self) {
-        let viewers: Vec<(ClientId, Uuid, String)> = self
+        let viewers: Vec<(ClientId, Spectate)> = self
             .clients
             .iter()
             .filter(|(&cid, c)| {
                 Some(cid) != self.controller && matches!(c.state, ClientState::Live)
             })
-            .map(|(&cid, c)| (cid, c.uuid, c.username.clone()))
+            .map(|(&cid, c)| {
+                let target = match c.spectate {
+                    Spectate::Ride => Spectate::Ride,
+                    _ => Spectate::Off,
+                };
+                (cid, target)
+            })
             .collect();
-        for (cid, uuid, name) in viewers {
-            let kit = reflect::spectator_kit(uuid, &name);
-            if let Some(c) = self.clients.get_mut(&cid) {
-                for f in kit {
-                    let _ = c.tx.try_send(f);
-                }
-                c.camera_on = false;
-            }
+        for (cid, target) in viewers {
+            self.apply_spectate(cid, target);
         }
     }
 
@@ -888,7 +924,7 @@ impl Session {
                 username,
                 uuid,
                 swallow_next_accept: false,
-                camera_on: false,
+                spectate: Spectate::Off,
             },
         );
         if self.cache.login.is_some() {
@@ -987,18 +1023,23 @@ impl Session {
         }
     }
 
-    /// Push synthesized frames at every Live viewer (never the controller).
-    fn send_to_viewers(&mut self, frames: &[Frame]) {
+    /// Relay the bot's movement to every Live viewer (never the
+    /// controller): ride-along spectators get the teleport that keeps
+    /// them at the bot (their reflected entity is hidden), everyone else
+    /// gets the reflected-entity update.
+    fn send_bot_movement(&mut self, reflected: &[Frame], follow: Option<&Frame>) {
         let mut dead = Vec::new();
         for (&id, c) in self.clients.iter() {
             if Some(id) == self.controller || !matches!(c.state, ClientState::Live) {
                 continue;
             }
-            for f in frames {
-                if c.tx.try_send(f.clone()).is_err() {
-                    dead.push(id);
-                    break;
-                }
+            let ok = if c.spectate == Spectate::Ride {
+                follow.map_or(true, |f| c.tx.try_send(f.clone()).is_ok())
+            } else {
+                reflected.iter().all(|f| c.tx.try_send(f.clone()).is_ok())
+            };
+            if !ok {
+                dead.push(id);
             }
         }
         for id in dead {
