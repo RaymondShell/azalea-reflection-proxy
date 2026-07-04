@@ -1,6 +1,6 @@
 [package]
 name = "azalea-reflection-proxy"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Spectate and take over an azalea bot session live through a local reflection proxy — Rust port of mineflayer-reflection-proxy"
 license = "MIT"
@@ -23,6 +23,7 @@ azalea-chat = "0.16"
 azalea-core = "0.16"
 azalea-entity = "0.16"
 azalea-registry = "0.16"
+azalea-inventory = "0.16"
 # same crate/version azalea-client uses to locate ~/.minecraft, so the
 # proxy's auth cache path is identical to Account::microsoft's
 minecraft_folder_path = "0.1.2"

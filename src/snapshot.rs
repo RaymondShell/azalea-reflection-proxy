@@ -45,6 +45,10 @@ pub struct WorldSnapshot {
     /// Full player-inventory content + slot deltas since.
     inventory_content: Option<Frame>,
     inventory_slots: Vec<Frame>,
+    /// Per-slot `set_player_inventory` (1.21.2+): the modern packet the
+    /// server uses to populate the player's own inventory and hotbar
+    /// outside a container screen. Keyed by slot so the latest wins.
+    player_inventory: HashMap<u32, Frame>,
     rain: Option<Frame>,
     rain_level: Option<Frame>,
     thunder_level: Option<Frame>,
@@ -333,6 +337,12 @@ impl WorldSnapshot {
                     self.inventory_slots.push(f.clone());
                 }
             }
+            ids::CB_GAME_SET_PLAYER_INVENTORY => {
+                // body starts with the slot index (var u32)
+                if let Some(slot) = leading_varint(&f.body) {
+                    self.player_inventory.insert(slot, f.clone());
+                }
+            }
             ids::CB_GAME_GAME_EVENT => match f.body.first() {
                 // 1 = start rain, 2 = stop rain: latest wins either way
                 Some(&1) | Some(&2) => self.rain = Some(f.clone()),
@@ -420,6 +430,7 @@ impl WorldSnapshot {
         q.extend(self.held_slot.iter().cloned());
         q.extend(self.inventory_content.iter().cloned());
         q.extend(self.inventory_slots.iter().cloned());
+        q.extend(self.player_inventory.values().cloned());
         q.extend(self.objectives.values().cloned());
         q.extend(self.displays.values().cloned());
         q.extend(self.scores.values().cloned());
@@ -430,6 +441,23 @@ impl WorldSnapshot {
         q.extend(self.rain.iter().cloned());
         q.extend(self.rain_level.iter().cloned());
         q.extend(self.thunder_level.iter().cloned());
+        q
+    }
+
+    /// The session player's own HUD state: held slot, inventory, health/
+    /// food, and xp. These already reach viewers live and are part of
+    /// `replay`, but a spectator's game mode hides the HUD; re-sending
+    /// them the moment a viewer switches to a HUD-showing game mode
+    /// (`,spectate`) guarantees the hotbar/inventory/bars are populated
+    /// immediately rather than waiting for the next server update.
+    pub fn self_hud_frames(&self) -> Vec<Frame> {
+        let mut q = Vec::new();
+        q.extend(self.held_slot.iter().cloned());
+        q.extend(self.inventory_content.iter().cloned());
+        q.extend(self.inventory_slots.iter().cloned());
+        q.extend(self.player_inventory.values().cloned());
+        q.extend(self.health.iter().cloned());
+        q.extend(self.experience.iter().cloned());
         q
     }
 }

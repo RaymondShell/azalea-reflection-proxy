@@ -63,8 +63,11 @@ env vars) wraps the same builder.
   teleport confirms itself so the session stays alive with nobody
   driving (unless `always_first_control` is on, in which case the
   oldest viewer inherits control)
-- `,spectate [username]` — lock the camera to a player entity (no arg
-  = the reflected bot; repeat with no arg to detach). Viewers only.
+- `,spectate [username]` — lock the camera to a player entity **and**
+  show the bot's HUD (inventory, held item, health/hunger, xp) — the
+  same on-screen UI `,acquire` gives you, without taking control. No
+  arg = the reflected bot; repeat with no arg to drop back to a
+  free-flying spectator. Viewers only.
 - `,gamemode <survival|creative|adventure|spectator|0-3>` —
   client-side game mode for the issuing viewer
 
