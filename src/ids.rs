@@ -51,6 +51,7 @@ pub const CB_GAME_SET_EXPERIENCE: u32 = 103;
 pub const CB_GAME_SET_HEALTH: u32 = 104;
 pub const CB_GAME_SET_HELD_SLOT: u32 = 105;
 pub const CB_GAME_SET_OBJECTIVE: u32 = 106;
+pub const CB_GAME_SET_PLAYER_INVENTORY: u32 = 108;
 pub const CB_GAME_SET_PLAYER_TEAM: u32 = 109;
 pub const CB_GAME_SET_SCORE: u32 = 110;
 pub const CB_GAME_SET_TIME: u32 = 113;
@@ -272,6 +273,7 @@ mod tests {
             c_reset_score::ClientboundResetScore,
             c_rotate_head::ClientboundRotateHead,
             c_set_health::ClientboundSetHealth,
+            c_set_player_inventory::ClientboundSetPlayerInventory,
             c_system_chat::ClientboundSystemChat,
             c_teleport_entity::ClientboundTeleportEntity,
             s_accept_teleportation::ServerboundAcceptTeleportation,
@@ -397,6 +399,15 @@ mod tests {
             .into_variant()
             .id(),
             CB_GAME_SET_HEALTH
+        );
+        assert_eq!(
+            ClientboundSetPlayerInventory {
+                slot: 0,
+                contents: azalea_inventory::ItemStack::Empty,
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_SET_PLAYER_INVENTORY
         );
         assert_eq!(
             ClientboundSystemChat {
