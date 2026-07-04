@@ -693,15 +693,18 @@ impl Session {
         Ok(())
     }
 
-    /// `,spectate [username]` — lock the camera to a player entity (no
-    /// arg = the reflected bot; repeat with no arg to detach).
+    /// `,spectate [username]` — lock the camera to a player entity and
+    /// show the bot's HUD (inventory, held item, health/hunger, xp), the
+    /// same on-screen UI `,acquire` gives you, without taking control.
+    /// No arg targets the reflected bot; repeat with no arg to drop back
+    /// to a free-flying spectator.
     fn cmd_spectate(&mut self, id: ClientId, arg: &str) {
         if Some(id) == self.controller {
             self.feedback(id, ",release first — the controller cannot spectate");
             return;
         }
-        let camera_on = match self.clients.get(&id) {
-            Some(c) => c.camera_on,
+        let (uuid, name, camera_on) = match self.clients.get(&id) {
+            Some(c) => (c.uuid, c.username.clone(), c.camera_on),
             None => return,
         };
         let (target, turning_on) = if arg.is_empty() {
@@ -726,14 +729,33 @@ impl Session {
                 }
             }
         };
+
+        // Build the packet burst before touching the client, so the
+        // snapshot borrow and the client borrow don't overlap.
+        let mut frames = Vec::new();
+        if turning_on {
+            // Spectator game mode hides the whole HUD, so switch to the
+            // bot's real game mode (+ flight, so swallowed inputs don't
+            // drop the viewer), repopulate inventory/vitals from the
+            // snapshot, then lock the camera to the target.
+            frames.extend(reflect::spectate_hud_kit(uuid, &name, self.real_game_mode));
+            frames.extend(self.cache.world.self_hud_frames());
+            frames.push(reflect::camera_frame(target));
+        } else {
+            // Back to a free-flying spectator with the camera on self.
+            frames.extend(reflect::spectator_kit(uuid, &name));
+            frames.push(reflect::camera_frame(target));
+        }
         if let Some(c) = self.clients.get_mut(&id) {
-            let _ = c.tx.try_send(reflect::camera_frame(target));
+            for f in frames {
+                let _ = c.tx.try_send(f);
+            }
             c.camera_on = turning_on;
         }
         self.feedback(
             id,
             if turning_on {
-                "camera attached — ,spectate again to detach"
+                "spectating with the bot's HUD — ,spectate again to free-look"
             } else {
                 "camera detached"
             },
@@ -816,7 +838,10 @@ impl Session {
     }
 
     /// Re-send the spectator kit to every Live viewer (after Login /
-    /// Respawn broadcasts, which reset client game modes).
+    /// Respawn broadcasts, which reset client game modes). A Login or
+    /// Respawn also resets the client's camera to its own entity, so any
+    /// HUD-spectate camera lock is gone: clear `camera_on` here so state
+    /// matches, and the viewer can re-issue `,spectate`.
     fn reassert_spectators(&mut self) {
         let viewers: Vec<(ClientId, Uuid, String)> = self
             .clients
@@ -828,10 +853,11 @@ impl Session {
             .collect();
         for (cid, uuid, name) in viewers {
             let kit = reflect::spectator_kit(uuid, &name);
-            if let Some(c) = self.clients.get(&cid) {
+            if let Some(c) = self.clients.get_mut(&cid) {
                 for f in kit {
                     let _ = c.tx.try_send(f);
                 }
+                c.camera_on = false;
             }
         }
     }

@@ -113,6 +113,24 @@ pub fn spectator_kit(viewer_uuid: Uuid, viewer_name: &str) -> Vec<Frame> {
     ]
 }
 
+/// Give a spectating viewer the bot's HUD without handing it control.
+/// Spectator game mode hides the entire HUD (hotbar, held item, health,
+/// hunger, xp), so to show the bot's inventory we switch the viewer to
+/// the session player's real game mode — exactly what `,acquire` does —
+/// but keep them out of the controller slot and grant flight so their
+/// (swallowed) inputs don't drop them out of the sky. The inventory and
+/// vitals themselves come from the snapshot's self-HUD frames, sent
+/// alongside this kit by the caller. Falls back to adventure (2) if the
+/// real game mode is spectator, which would hide the HUD we're after.
+pub fn spectate_hud_kit(uuid: Uuid, name: &str, real_mode: u8) -> Vec<Frame> {
+    let mode = if real_mode == 3 { 2 } else { real_mode };
+    vec![
+        own_info_frame(uuid, name, mode),
+        gamemode_event_frame(mode),
+        abilities_frame(true),
+    ]
+}
+
 /// The reverse: restore a client to the session's real game mode when
 /// it acquires control.
 pub fn controller_kit(uuid: Uuid, name: &str, real_mode: u8) -> Vec<Frame> {
@@ -128,9 +146,11 @@ pub fn controller_kit(uuid: Uuid, name: &str, real_mode: u8) -> Vec<Frame> {
 /// with the client's own player id to detach.
 pub fn camera_frame(entity_id: i32) -> Frame {
     use azalea_protocol::packets::game::c_set_camera::ClientboundSetCamera;
-    frame_of(ClientboundSetCamera {
+    let f = frame_of(ClientboundSetCamera {
         camera_id: MinecraftEntityId(entity_id),
-    })
+    });
+    debug_assert_eq!(f.packet_id, ids::CB_GAME_SET_CAMERA);
+    f
 }
 
 /// Client-side game mode change for one client (the `,gamemode`
@@ -444,5 +464,39 @@ mod tests {
         let pose = BotPose::default();
         assert!(spawn_frames(Uuid::nil(), &pose).is_empty());
         assert!(move_frames(&pose).is_empty());
+    }
+
+    /// The HUD-spectate kit must switch to the bot's real game mode so
+    /// the HUD renders, but never to spectator (which hides it): mode 3
+    /// falls back to adventure (2).
+    fn kit_game_mode(kit: &[Frame]) -> f32 {
+        use azalea_protocol::packets::ProtocolPacket;
+        use azalea_protocol::packets::game::ClientboundGamePacket;
+        use azalea_protocol::packets::game::c_game_event::EventType;
+        for f in kit {
+            if let Ok(ClientboundGamePacket::GameEvent(g)) =
+                ClientboundGamePacket::read(f.packet_id, &mut Cursor::new(&f.body[..]))
+            {
+                if matches!(g.event, EventType::ChangeGameMode) {
+                    return g.param;
+                }
+            }
+        }
+        panic!("kit has no ChangeGameMode game event");
+    }
+
+    #[test]
+    fn spectate_hud_kit_preserves_real_mode() {
+        let kit = spectate_hud_kit(Uuid::nil(), "viewer", 0); // survival
+        assert_eq!(kit.len(), 3);
+        assert_eq!(kit_game_mode(&kit), 0.0);
+        // adventure passes through unchanged
+        assert_eq!(kit_game_mode(&spectate_hud_kit(Uuid::nil(), "v", 2)), 2.0);
+    }
+
+    #[test]
+    fn spectate_hud_kit_avoids_spectator_mode() {
+        // a spectator real mode would hide the HUD → adventure fallback
+        assert_eq!(kit_game_mode(&spectate_hud_kit(Uuid::nil(), "v", 3)), 2.0);
     }
 }

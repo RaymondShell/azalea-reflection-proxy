@@ -432,4 +432,20 @@ impl WorldSnapshot {
         q.extend(self.thunder_level.iter().cloned());
         q
     }
+
+    /// The session player's own HUD state: held slot, inventory, health/
+    /// food, and xp. These already reach viewers live and are part of
+    /// `replay`, but a spectator's game mode hides the HUD; re-sending
+    /// them the moment a viewer switches to a HUD-showing game mode
+    /// (`,spectate`) guarantees the hotbar/inventory/bars are populated
+    /// immediately rather than waiting for the next server update.
+    pub fn self_hud_frames(&self) -> Vec<Frame> {
+        let mut q = Vec::new();
+        q.extend(self.held_slot.iter().cloned());
+        q.extend(self.inventory_content.iter().cloned());
+        q.extend(self.inventory_slots.iter().cloned());
+        q.extend(self.health.iter().cloned());
+        q.extend(self.experience.iter().cloned());
+        q
+    }
 }

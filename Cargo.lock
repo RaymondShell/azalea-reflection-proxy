@@ -310,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "azalea-reflection-proxy"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "azalea-auth",
