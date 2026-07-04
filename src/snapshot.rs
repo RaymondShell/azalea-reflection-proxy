@@ -97,6 +97,23 @@ fn leading_varint_pair(body: &[u8]) -> Option<(u32, u32)> {
     Some((a, b))
 }
 
+/// Return a copy of a player-info entry with all property signatures
+/// removed. The bot re-serializes forwarded profiles through azalea,
+/// and a texture property whose signature is present-but-empty makes
+/// the vanilla viewer throw "Bad signature length: got 0 but was
+/// expecting 512" and drop the skin. Offline-mode viewers can't verify
+/// Mojang signatures anyway, so stripping them (signature = None) makes
+/// the client use the skin unsigned instead of erroring.
+fn strip_signatures(entry: &PlayerInfoEntry) -> PlayerInfoEntry {
+    let mut e = entry.clone();
+    let mut props = (*e.profile.properties).clone();
+    for v in props.map.values_mut() {
+        v.signature = None;
+    }
+    e.profile.properties = std::sync::Arc::new(props);
+    e
+}
+
 fn compact_angle(deg: f32) -> i8 {
     (deg.rem_euclid(360.0) / 360.0 * 256.0) as i32 as i8
 }
@@ -491,7 +508,7 @@ impl WorldSnapshot {
                     update_list_order: false,
                     update_hat: false,
                 },
-                entries: self.players.values().cloned().collect(),
+                entries: self.players.values().map(strip_signatures).collect(),
             }));
         }
         for (id, e) in &self.entities {
@@ -643,6 +660,35 @@ mod tests {
             )
         });
         assert!(!has_boss);
+    }
+
+    /// Replayed player-info must carry no property signatures, or an
+    /// offline viewer throws "Bad signature length: got 0" and drops the
+    /// skin. Value is kept; only the signature is cleared.
+    #[test]
+    fn strip_signatures_clears_only_the_signature() {
+        use azalea_auth::game_profile::{GameProfile, GameProfileProperties, ProfilePropertyValue};
+        use std::sync::Arc;
+
+        let mut props = GameProfileProperties::default();
+        props.map.insert(
+            "textures".to_string(),
+            ProfilePropertyValue {
+                value: "base64value".to_string(),
+                signature: Some("some-signature".to_string()),
+            },
+        );
+        let mut entry = PlayerInfoEntry::default();
+        entry.profile = GameProfile {
+            uuid: Uuid::from_u128(1),
+            name: "Player".to_string(),
+            properties: Arc::new(props),
+        };
+
+        let stripped = strip_signatures(&entry);
+        let v = stripped.profile.properties.map.get("textures").unwrap();
+        assert_eq!(v.value, "base64value");
+        assert_eq!(v.signature, None);
     }
 
     /// A viewer that missed the objective's Add and only sees a stream

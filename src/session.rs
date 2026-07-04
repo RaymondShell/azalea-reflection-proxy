@@ -603,7 +603,14 @@ impl Session {
             if reflect::apply_controller_move(&mut self.pose, &frame) {
                 let update = if self.respawn_entity_pending && self.pose.pos.is_some() {
                     self.respawn_entity_pending = false;
-                    reflect::spawn_frames(self.bot_uuid, &self.pose)
+                    // Re-send the bot's player-info first: a Login/Respawn
+                    // (e.g. a Hypixel lobby switch) clears the client's tab
+                    // list, so spawning the reflected player entity without
+                    // re-adding its profile makes the client log "add player
+                    // prior to sending player info" and drop the entity.
+                    let mut v = vec![reflect::bot_info_frame(self.bot_uuid, &self.bot_name)];
+                    v.extend(reflect::spawn_frames(self.bot_uuid, &self.pose));
+                    v
                 } else {
                     reflect::move_frames(&self.pose)
                 };
