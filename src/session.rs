@@ -167,6 +167,11 @@ struct Session {
     /// Entities were wiped client-side (login/respawn); the reflected
     /// entity must be re-spawned at the next known pose.
     respawn_entity_pending: bool,
+    /// Set when the controller sends a movement packet; checked and
+    /// cleared each stand-in tick. If it stays false for a whole tick,
+    /// the bot has gone idle and the proxy injects a position heartbeat
+    /// so Hypixel's movement stream never falls silent ("Out of sync").
+    controller_moved_recently: bool,
     /// Viewers normally don't get the session's PlayerPosition frames
     /// (their camera is free), but after a dimension change they need
     /// exactly one to land in the new world.
@@ -249,6 +254,7 @@ pub fn spawn(
         real_game_mode: 0,
         abilities: None,
         respawn_entity_pending: false,
+        controller_moved_recently: false,
         forward_next_position: false,
         real_player_id: None,
         opts,
@@ -478,14 +484,25 @@ impl Session {
         }
     }
 
-    /// Controllerless position heartbeat. An idle vanilla client still
-    /// reports its position every second; without this, Hypixel treats
+    /// Position heartbeat. A vanilla client reports its position roughly
+    /// every second even when standing still; without it Hypixel treats
     /// the silent movement stream as a broken connection ("Out of sync,
-    /// check your internet connection!") and dumps the player to Limbo
-    /// ~15s after the controller releases or disconnects.
+    /// check your internet connection!") and dumps the player to Limbo.
+    ///
+    /// An idle azalea bot stops sending movement entirely, so this fires
+    /// in two cases: when nobody is driving at all (controllerless), and
+    /// when a controller IS attached but sent no movement in the last
+    /// tick (the bot went idle). While the bot is actively moving, its
+    /// own packets carry the stream and this injects nothing.
     async fn stand_in_tick(&mut self) {
-        if self.controller.is_some() || !matches!(self.upstream_state, UpstreamState::Game) {
+        if !matches!(self.upstream_state, UpstreamState::Game) {
             return;
+        }
+        if self.controller.is_some() {
+            let moved = std::mem::replace(&mut self.controller_moved_recently, false);
+            if moved {
+                return; // bot is driving; don't inject a competing packet
+            }
         }
         let Some(f) = reflect::idle_move_frame(&self.pose) else {
             return; // pose unknown until the first teleport lands
@@ -637,6 +654,11 @@ impl Session {
             // Update our pose snapshot from this movement (needs the frame
             // before it's consumed by the pipeline below).
             let moved = reflect::apply_controller_move(&mut self.pose, &frame);
+            if moved {
+                // note activity so the idle heartbeat only fires when the
+                // bot has actually gone quiet
+                self.controller_moved_recently = true;
+            }
 
             // Forward the bot's movement UPSTREAM FIRST, before any viewer
             // mirroring. Hypixel's movement anticheat is latency-sensitive:
