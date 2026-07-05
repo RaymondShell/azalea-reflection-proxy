@@ -63,16 +63,14 @@ env vars) wraps the same builder.
   teleport confirms itself so the session stays alive with nobody
   driving (unless `always_first_control` is on, in which case the
   oldest viewer inherits control)
-- `,spectate [username]` — with no arg (or the bot's name), **ride
-  along** with the bot: you're glued to its position seeing what it
-  sees, **with** its full HUD (inventory, held item, health/hunger,
-  xp) — the same on-screen UI `,acquire` gives, without taking
-  control. Repeat with no arg to drop back to a free-flying spectator.
-  With another player's name, locks the camera to them (spectator
-  mode, no HUD). Viewers only. (A true camera-lock and the HUD can't
-  coexist on the client — spectator mode is required for `SetCamera`
-  but hides the HUD — so the ride-along teleports you to the bot each
-  tick instead, which gives both.)
+- `,spectate [username]` — lock your camera to an entity (a plain
+  `SetCamera`, like the original). No arg (or the bot's name) locks to
+  the reflected bot, so you see what the bot sees; another player's
+  name locks to them. Run it again on the same target to release the
+  camera back to your own player. You stay in the bot's game mode the
+  whole time (never spectator), so the **full HUD** — inventory, held
+  item, health/hunger, xp — stays visible whether or not the camera is
+  locked. Viewers only.
 - `,gamemode <survival|creative|adventure|spectator|0-3>` —
   client-side game mode for the issuing viewer
 
@@ -123,14 +121,16 @@ tokio::spawn(async move {
   per uuid and replayed as a synthesized `Add`, so a viewer joining
   mid-fight doesn't crash on the next boss-bar update). Cached as raw
   frames and replayed to mid-session joiners.
-- Spectator viewers (`reflect.rs`) — viewers get the full spectator kit
-  on join (own-uuid player info + game event + abilities — modern
-  clients key game mode off the player-info entry, so the event alone
-  is not enough), re-asserted after every Login/Respawn broadcast. They
-  see the bot as a synthesized player entity mirrored live from the
-  controller's serverbound movement packets. The session's own
-  teleports, abilities, and game-mode changes are filtered away from
-  viewers so their free camera survives; one position frame is let
+- Viewers (`reflect.rs`) — like the original, viewers stay in the
+  bot's game mode with flight (own-uuid player info + game event +
+  abilities — modern clients key game mode off the player-info entry,
+  so the event alone is not enough), re-asserted after every
+  Login/Respawn. That keeps the HUD on and lets them free-fly. They see
+  the bot as a synthesized reflected player entity, mirrored live from
+  the controller's serverbound movement packets, and `,spectate` is a
+  plain `SetCamera` toggle onto it (or another player). The session's
+  own teleports, abilities, and game-mode changes are filtered away
+  from viewers so their view survives; one position frame is let
   through after dimension changes so they land in the new world.
 - Login legs (`upstream.rs`, `local_server.rs`) — full Microsoft auth +
   encryption + compression dance upstream; offline-mode mirror locally
@@ -159,10 +159,11 @@ parses that one packet.
 ## Status
 
 Everything above is implemented. The passthrough and replicator paths
-(bot through proxy, viewer join, terrain), spectator mode, and
-`,spectate` with the bot's HUD have been tested live — hardening the
-mid-session join (modern inventory sync, boss-bar replay) came directly
-out of that testing. Control handoff, the event stream, and
+(bot through proxy, viewer join, terrain) and the viewer HUD have been
+tested live — hardening the mid-session join (modern inventory sync,
+boss-bar replay) came directly out of that testing. The `,spectate`
+`SetCamera` toggle is newly reworked to match the original and is
+unverified on the live client. Control handoff, the event stream, and
 whitelist/max_clients have unit-test coverage but little live mileage
 yet. Treat `,acquire` with care on anticheat-guarded servers: position
 is aligned on handoff, but momentum is not carried over.

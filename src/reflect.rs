@@ -102,27 +102,17 @@ fn abilities_frame(flying: bool) -> Frame {
     })
 }
 
-/// The full "become a spectator" sequence for a viewer: own-uuid player
-/// info, the game event, and flight abilities. Re-send after every
-/// Login/Respawn the viewer receives — those reset client game mode.
-pub fn spectator_kit(viewer_uuid: Uuid, viewer_name: &str) -> Vec<Frame> {
-    vec![
-        own_info_frame(viewer_uuid, viewer_name, 3),
-        gamemode_event_frame(3),
-        abilities_frame(true),
-    ]
-}
-
-/// Give a spectating viewer the bot's HUD without handing it control.
-/// Spectator game mode hides the entire HUD (hotbar, held item, health,
-/// hunger, xp), so to show the bot's inventory we switch the viewer to
-/// the session player's real game mode — exactly what `,acquire` does —
-/// but keep them out of the controller slot and grant flight so their
-/// (swallowed) inputs don't drop them out of the sky. The inventory and
-/// vitals themselves come from the snapshot's self-HUD frames, sent
-/// alongside this kit by the caller. Falls back to adventure (2) if the
-/// real game mode is spectator, which would hide the HUD we're after.
-pub fn spectate_hud_kit(uuid: Uuid, name: &str, real_mode: u8) -> Vec<Frame> {
+/// The default setup for a viewer, matching the original project: keep
+/// them in the SESSION PLAYER's real game mode (not spectator) so the
+/// whole HUD — hotbar, held item, health/hunger, xp — renders from the
+/// bot's synced inventory and vitals, and grant flight so they can
+/// free-fly while their (swallowed) inputs never touch the server.
+/// `,spectate` then just re-points the camera with a SetCamera packet,
+/// which works fine in a non-spectator game mode. Re-send after every
+/// Login/Respawn, which resets the client's game mode. Falls back to
+/// adventure (2) if the real game mode is spectator, which would hide
+/// the HUD.
+pub fn viewer_kit(uuid: Uuid, name: &str, real_mode: u8) -> Vec<Frame> {
     let mode = if real_mode == 3 { 2 } else { real_mode };
     vec![
         own_info_frame(uuid, name, mode),
@@ -207,38 +197,6 @@ pub fn handoff_teleport_frame(pose: &BotPose) -> Option<Frame> {
     use azalea_protocol::packets::game::c_player_position::ClientboundPlayerPosition;
     Some(frame_of(ClientboundPlayerPosition {
         id: HANDOFF_TELEPORT_ID,
-        change: PositionMoveRotation {
-            pos: pose.pos?,
-            delta: Vec3::default(),
-            look_direction: pose.look,
-        },
-        relative: RelativeMovements::all_absolute(),
-    }))
-}
-
-/// Teleport id for the ride-along `,spectate`; the viewer's accept is a
-/// swallowed serverbound frame, so the id only needs to be constant.
-pub const FOLLOW_TELEPORT_ID: u32 = 0x5EC0FF;
-
-/// Glue a ride-along spectator to the bot: set their position AND view
-/// to the bot's, absolutely. Sent once per controller move, so the
-/// viewer tracks the bot at the bot's own movement rate. Their client
-/// entity sits at the bot's feet and the reflected entity is hidden for
-/// them, so it's a first-person "become the bot" view — what the bot
-/// sees — with the bot's HUD showing, the camera-lock/HUD combo
-/// SetCamera can't do in a non-spectator game mode.
-///
-/// All fields are absolute deliberately: azalea 0.16's
-/// `RelativeMovements::azalea_write` byte-reverses its output, so any
-/// non-zero relative flag arrives mangled at the client — only the
-/// all-absolute encoding (`[0,0,0,0]`, symmetric under the reversal)
-/// is safe to send. That also matches the old spectator camera-lock
-/// feel (view follows the bot), so it's no loss here.
-pub fn follow_teleport_frame(pose: &BotPose) -> Option<Frame> {
-    use azalea_protocol::common::movements::{PositionMoveRotation, RelativeMovements};
-    use azalea_protocol::packets::game::c_player_position::ClientboundPlayerPosition;
-    Some(frame_of(ClientboundPlayerPosition {
-        id: FOLLOW_TELEPORT_ID,
         change: PositionMoveRotation {
             pos: pose.pos?,
             delta: Vec3::default(),
@@ -514,37 +472,8 @@ mod tests {
         assert!(move_frames(&pose).is_empty());
     }
 
-    #[test]
-    fn follow_teleport_glues_viewer_to_bot() {
-        use azalea_protocol::packets::ProtocolPacket;
-        use azalea_protocol::packets::game::ClientboundGamePacket;
-
-        let mut pose = BotPose::default();
-        assert!(follow_teleport_frame(&pose).is_none()); // no position yet
-
-        pose.pos = Some(Vec3 {
-            x: 10.0,
-            y: 64.0,
-            z: -5.0,
-        });
-        pose.look = LookDirection::new(45.0, 12.0);
-        let f = follow_teleport_frame(&pose).unwrap();
-        match ClientboundGamePacket::read(f.packet_id, &mut Cursor::new(&f.body[..])).unwrap() {
-            ClientboundGamePacket::PlayerPosition(p) => {
-                assert_eq!(p.change.pos.x, 10.0);
-                assert_eq!(p.change.pos.z, -5.0);
-                assert_eq!(p.change.look_direction.y_rot(), 45.0);
-                // fully absolute — the only encoding azalea 0.16 writes
-                // correctly (see follow_teleport_frame doc)
-                assert!(!p.relative.x && !p.relative.y && !p.relative.z);
-                assert!(!p.relative.y_rot && !p.relative.x_rot);
-            }
-            other => panic!("expected PlayerPosition, got {other:?}"),
-        }
-    }
-
-    /// The HUD-spectate kit must switch to the bot's real game mode so
-    /// the HUD renders, but never to spectator (which hides it): mode 3
+    /// The viewer kit must put the viewer in the bot's real game mode so
+    /// the HUD renders, but never spectator (which hides it): mode 3
     /// falls back to adventure (2).
     fn kit_game_mode(kit: &[Frame]) -> f32 {
         use azalea_protocol::packets::ProtocolPacket;
@@ -563,17 +492,17 @@ mod tests {
     }
 
     #[test]
-    fn spectate_hud_kit_preserves_real_mode() {
-        let kit = spectate_hud_kit(Uuid::nil(), "viewer", 0); // survival
+    fn viewer_kit_preserves_real_mode() {
+        let kit = viewer_kit(Uuid::nil(), "viewer", 0); // survival
         assert_eq!(kit.len(), 3);
         assert_eq!(kit_game_mode(&kit), 0.0);
         // adventure passes through unchanged
-        assert_eq!(kit_game_mode(&spectate_hud_kit(Uuid::nil(), "v", 2)), 2.0);
+        assert_eq!(kit_game_mode(&viewer_kit(Uuid::nil(), "v", 2)), 2.0);
     }
 
     #[test]
-    fn spectate_hud_kit_avoids_spectator_mode() {
+    fn viewer_kit_avoids_spectator_mode() {
         // a spectator real mode would hide the HUD → adventure fallback
-        assert_eq!(kit_game_mode(&spectate_hud_kit(Uuid::nil(), "v", 3)), 2.0);
+        assert_eq!(kit_game_mode(&viewer_kit(Uuid::nil(), "v", 3)), 2.0);
     }
 }
