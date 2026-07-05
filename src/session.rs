@@ -205,7 +205,11 @@ pub fn spawn(
     let (msg_tx, msg_rx) = mpsc::channel::<SessionMsg>(1024);
     let upstream_tx = start_upstream_io(upstream, msg_tx.clone());
 
-    let (ctl_tx, ctl_rx) = mpsc::channel::<Frame>(4096);
+    // Generous buffer: the controller is never sent frames with a
+    // blocking await (that would let a slow bot stall the whole actor),
+    // so this bound is a memory ceiling / "hopelessly behind" tripwire,
+    // sized to absorb a full render-distance warp burst.
+    let (ctl_tx, ctl_rx) = mpsc::channel::<Frame>(16384);
     let mut clients = HashMap::new();
     clients.insert(
         controller_id,
@@ -429,31 +433,47 @@ impl Session {
         }
     }
 
-    /// With no controller attached, the proxy must keep the session
-    /// alive itself: answer keepalives and confirm teleports. (Duplicate
-    /// replies are dangerous, so this runs ONLY when controllerless.)
+    /// Keep the session alive from the proxy side.
+    ///
+    /// Keepalives are answered here on EVERY server keepalive, even while
+    /// a controller is driving — that decouples session liveness from how
+    /// fast the bot reads, so a busy bot (a warp burst, heavy pathfinding)
+    /// can never get the connection "timed out -> Limbo". The bot still
+    /// receives the keepalive so azalea's own liveness is satisfied, but
+    /// its duplicate reply is swallowed in `on_client_frame`. The
+    /// round-trip Hypixel measures is still the real proxy<->server ping,
+    /// so this doesn't spoof a suspicious ~0ms latency.
+    ///
+    /// Teleport-accepts and the idle position heartbeat only matter when
+    /// nobody is driving — the controller confirms its own teleports and
+    /// reports its own position.
     async fn stand_in(&mut self, f: &Frame) {
-        if self.controller.is_some() {
+        // 1. Answer keepalives regardless of controller.
+        let keepalive = match self.upstream_state {
+            UpstreamState::Game if f.packet_id == ids::CB_GAME_KEEP_ALIVE => {
+                reflect::keepalive_id(f).map(reflect::keepalive_reply)
+            }
+            UpstreamState::Config if f.packet_id == ids::CB_CONFIG_KEEP_ALIVE => {
+                reflect::keepalive_id(f).map(reflect::config_keepalive_reply)
+            }
+            _ => None,
+        };
+        if let Some(r) = keepalive {
+            if self.upstream_tx.send(r).await.is_err() {
+                tracing::warn!("keepalive reply failed: upstream writer closed");
+            }
             return;
         }
-        let reply = match self.upstream_state {
-            UpstreamState::Game => match f.packet_id {
-                ids::CB_GAME_KEEP_ALIVE => reflect::keepalive_id(f).map(reflect::keepalive_reply),
-                ids::CB_GAME_PLAYER_POSITION => {
-                    reflect::teleport_id(f).map(reflect::accept_teleport_frame)
+
+        // 2. Teleport-accept only when nobody is driving.
+        if self.controller.is_none()
+            && matches!(self.upstream_state, UpstreamState::Game)
+            && f.packet_id == ids::CB_GAME_PLAYER_POSITION
+        {
+            if let Some(r) = reflect::teleport_id(f).map(reflect::accept_teleport_frame) {
+                if self.upstream_tx.send(r).await.is_err() {
+                    tracing::warn!("stand-in teleport-accept failed: upstream writer closed");
                 }
-                _ => None,
-            },
-            UpstreamState::Config => match f.packet_id {
-                ids::CB_CONFIG_KEEP_ALIVE => {
-                    reflect::keepalive_id(f).map(reflect::config_keepalive_reply)
-                }
-                _ => None,
-            },
-        };
-        if let Some(r) = reply {
-            if self.upstream_tx.send(r).await.is_err() {
-                tracing::warn!("stand-in reply failed: upstream writer closed");
             }
         }
     }
@@ -585,6 +605,17 @@ impl Session {
         }
 
         if Some(id) == self.controller {
+            // Swallow the bot's keepalive reply: the proxy already answered
+            // it in stand_in(), and a duplicate keepalive would look wrong
+            // to the server. (Proxy-owned keepalives are what keep the
+            // session alive when the bot is slow.)
+            if (matches!(self.upstream_state, UpstreamState::Game)
+                && frame.packet_id == ids::SB_GAME_KEEP_ALIVE)
+                || (matches!(self.upstream_state, UpstreamState::Config)
+                    && frame.packet_id == ids::SB_CONFIG_KEEP_ALIVE)
+            {
+                return Ok(());
+            }
             // swallow the accept for a proxy-issued handoff teleport
             if frame.packet_id == ids::SB_GAME_ACCEPT_TELEPORTATION
                 && matches!(self.upstream_state, UpstreamState::Game)
@@ -603,10 +634,26 @@ impl Session {
                     }
                 }
             }
-            // mirror the bot's movement before the frame moves on: to
-            // ordinary spectators as the reflected entity, to ride-along
-            // spectators as a teleport that glues them to the bot.
-            if reflect::apply_controller_move(&mut self.pose, &frame) {
+            // Update our pose snapshot from this movement (needs the frame
+            // before it's consumed by the pipeline below).
+            let moved = reflect::apply_controller_move(&mut self.pose, &frame);
+
+            // Forward the bot's movement UPSTREAM FIRST, before any viewer
+            // mirroring. Hypixel's movement anticheat is latency-sensitive:
+            // delaying each movement packet behind the reflection work pushes
+            // the server's view of the bot behind its real position, which
+            // shows up as constant ~1-2 block setbacks and, during fast
+            // movement, accumulates into an "out of sync" Limbo. Viewers can
+            // tolerate the frame of latency; the server cannot.
+            for f in self.pipeline.serverbound(frame) {
+                if self.upstream_tx.send(f).await.is_err() {
+                    eyre::bail!("upstream writer closed");
+                }
+            }
+
+            // Then mirror to spectators: ordinary ones see the reflected
+            // entity move; ride-along ones get glued to the bot.
+            if moved {
                 let update = if self.respawn_entity_pending && self.pose.pos.is_some() {
                     self.respawn_entity_pending = false;
                     // Idempotent re-spawn: clear any previous copy, re-add
@@ -619,11 +666,6 @@ impl Session {
                     reflect::move_frames(&self.pose)
                 };
                 self.send_to_viewers(&update);
-            }
-            for f in self.pipeline.serverbound(frame) {
-                if self.upstream_tx.send(f).await.is_err() {
-                    eyre::bail!("upstream writer closed");
-                }
             }
             return Ok(());
         }
@@ -957,10 +999,15 @@ impl Session {
         }
     }
 
-    /// Send a clientbound frame to every Live client. The controller gets
-    /// backpressure (awaited send — it must not lose frames); viewers get
-    /// try_send and are dropped if they can't keep up, so one laggy
-    /// spectator can never stall the real session.
+    /// Send a clientbound frame to every Live client. Nobody — not even
+    /// the controller — is sent with a blocking await: awaiting the
+    /// controller here used to stall the entire session actor whenever
+    /// the bot fell behind reading (a warp burst, heavy pathfinding),
+    /// which stopped forwarding the bot's OWN keepalives to the server
+    /// and got the session "connection timed out -> Limbo". A controller
+    /// that overflows its large buffer is hopelessly behind, so it's
+    /// dropped (clean session end) rather than allowed to freeze the
+    /// session; frames are never silently lost, only whole clients.
     async fn broadcast(&mut self, frame: Frame) {
         let viewers_receive = self.viewers_receive(&frame);
         let mut dead = Vec::new();
@@ -968,11 +1015,8 @@ impl Session {
             if !matches!(c.state, ClientState::Live) {
                 continue;
             }
-            if Some(id) == self.controller {
-                if c.tx.send(frame.clone()).await.is_err() {
-                    dead.push(id);
-                }
-            } else if viewers_receive && c.tx.try_send(frame.clone()).is_err() {
+            let deliver = Some(id) == self.controller || viewers_receive;
+            if deliver && c.tx.try_send(frame.clone()).is_err() {
                 dead.push(id);
             }
         }

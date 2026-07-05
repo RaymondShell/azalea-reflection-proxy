@@ -16,6 +16,7 @@ pub const CB_CONFIG_KEEP_ALIVE: u32 = 4;
 pub const CB_CONFIG_PING: u32 = 5;
 
 // config, serverbound
+pub const SB_CONFIG_KEEP_ALIVE: u32 = 4;
 pub const SB_CONFIG_FINISH: u32 = 3;
 
 // game, clientbound
@@ -65,6 +66,7 @@ pub const CB_GAME_UPDATE_MOB_EFFECT: u32 = 132;
 // game, serverbound
 pub const SB_GAME_ACCEPT_TELEPORTATION: u32 = 0;
 pub const SB_GAME_CHAT: u32 = 9;
+pub const SB_GAME_KEEP_ALIVE: u32 = 28;
 pub const SB_GAME_MOVE_PLAYER_POS: u32 = 30;
 pub const SB_GAME_MOVE_PLAYER_POS_ROT: u32 = 31;
 pub const SB_GAME_MOVE_PLAYER_ROT: u32 = 32;
@@ -444,12 +446,20 @@ mod tests {
             ServerboundAcceptTeleportation { id: 0 }.into_variant().id(),
             SB_GAME_ACCEPT_TELEPORTATION
         );
-        assert_eq!(ServerboundKeepAlive { id: 0 }.into_variant().id(), 28);
+        assert_eq!(
+            ServerboundKeepAlive { id: 0 }.into_variant().id(),
+            SB_GAME_KEEP_ALIVE
+        );
         {
+            use azalea_protocol::packets::config::s_keep_alive::ServerboundKeepAlive as ConfigKeepAlive;
             use azalea_protocol::packets::game::c_set_camera::ClientboundSetCamera;
             assert_eq!(
                 ClientboundSetCamera { camera_id: eid }.into_variant().id(),
                 CB_GAME_SET_CAMERA
+            );
+            assert_eq!(
+                ConfigKeepAlive { id: 0 }.into_variant().id(),
+                SB_CONFIG_KEEP_ALIVE
             );
         }
     }
