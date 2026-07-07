@@ -1037,6 +1037,20 @@ impl Session {
     /// dropped (clean session end) rather than allowed to freeze the
     /// session; frames are never silently lost, only whole clients.
     async fn broadcast(&mut self, frame: Frame) {
+        // The server can echo the bot's own body as a real entity carrying
+        // the bot's uuid (Hypixel does this across lobby switches). NO local
+        // client should see it: a viewer has the synthesized reflected entity
+        // with the same uuid, so the echo collides as a "Duplicate entity
+        // UUID" and the client drops the bot avatar; the controller is
+        // first-person, so its own body echo is a self-ghost. Worse, a
+        // controller that received the echo keeps it after being demoted to
+        // spectator, where the reflected bundle then collides with it. The
+        // snapshot already skips it for join replay — drop it on the live
+        // path for everyone. (Our own reflected entity goes out via
+        // send_to_viewers, not here, so this never suppresses the avatar.)
+        if reflect::add_entity_uuid(&frame) == Some(self.bot_uuid) {
+            return;
+        }
         let viewers_receive = self.viewers_receive(&frame);
         let mut dead = Vec::new();
         for (&id, c) in self.clients.iter() {

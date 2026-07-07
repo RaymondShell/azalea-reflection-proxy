@@ -238,6 +238,22 @@ pub fn chat_text(frame: &Frame) -> Option<String> {
     }
 }
 
+/// Uuid of a clientbound AddEntity frame, if it is one. Used to drop the
+/// server's echo of the bot's own body before it reaches a viewer, where
+/// it would collide with the reflected entity (same uuid) as a
+/// "Duplicate entity UUID" and take the bot avatar down with it.
+pub fn add_entity_uuid(frame: &Frame) -> Option<Uuid> {
+    use azalea_protocol::packets::ProtocolPacket;
+    use azalea_protocol::packets::game::ClientboundGamePacket;
+    if frame.packet_id != ids::CB_GAME_ADD_ENTITY {
+        return None;
+    }
+    match ClientboundGamePacket::read(frame.packet_id, &mut Cursor::new(&frame.body[..])) {
+        Ok(ClientboundGamePacket::AddEntity(p)) => Some(p.uuid),
+        _ => None,
+    }
+}
+
 /// Teleport id of a clientbound PlayerPosition frame (for controllerless
 /// auto-accept).
 pub fn teleport_id(frame: &Frame) -> Option<u32> {
@@ -463,6 +479,34 @@ mod tests {
         assert_eq!(angle_byte(90.0), 64);
         // -90° wraps to 270° = 192/256 = -64 as i8
         assert_eq!(angle_byte(-90.0), -64);
+    }
+
+    /// add_entity_uuid pulls the uuid out of a real AddEntity frame (so
+    /// the session can drop the server's echo of the bot's own body before
+    /// it collides with the reflected entity) and ignores everything else.
+    #[test]
+    fn add_entity_uuid_reads_only_add_entity() {
+        use azalea_core::delta::LpVec3;
+        use azalea_core::entity_id::MinecraftEntityId;
+        use azalea_protocol::packets::game::c_add_entity::ClientboundAddEntity;
+        use azalea_registry::builtin::EntityKind;
+
+        let uuid = Uuid::from_u128(0x513d);
+        let add = frame_of(ClientboundAddEntity {
+            id: MinecraftEntityId(42),
+            uuid,
+            entity_type: EntityKind::Player,
+            position: Vec3::default(),
+            movement: LpVec3::Zero,
+            x_rot: 0,
+            y_rot: 0,
+            y_head_rot: 0,
+            data: 0,
+        });
+        assert_eq!(add_entity_uuid(&add), Some(uuid));
+
+        // a non-AddEntity frame yields None (camera_frame is a SetCamera)
+        assert_eq!(add_entity_uuid(&camera_frame(1)), None);
     }
 
     #[test]
