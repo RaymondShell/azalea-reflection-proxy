@@ -130,6 +130,10 @@ pub async fn accept_login(stream: TcpStream) -> Result<LocalClient> {
                     name: username.clone(),
                     properties: Arc::new(Default::default()),
                 },
+                // mc26.2 added a chat-session UUID here. The proxy owns the
+                // real upstream session and doesn't sign chat on this local
+                // leg, so a nil UUID is the correct neutral value.
+                session_id: uuid::Uuid::nil(),
             }).await?;
 
             // 5. Wait for LoginAcknowledged

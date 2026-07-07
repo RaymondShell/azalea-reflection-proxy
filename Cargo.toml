@@ -13,17 +13,19 @@ categories = ["game-development", "network-programming"]
 exclude = [".github/", ".idea/"]
 
 [dependencies]
-# Same stable release as the bot — the proxy must speak the exact same
-# protocol version the bot does.
-azalea-protocol = "0.16"
-azalea-auth = "0.16"
-azalea-crypto = "0.16"
-azalea-buf = "0.16"
-azalea-chat = "0.16"
-azalea-core = "0.16"
-azalea-entity = "0.16"
-azalea-registry = "0.16"
-azalea-inventory = "0.16"
+# Track azalea's git `main` — the proxy must speak the exact same protocol
+# version the bot does, and bots built against git are on the newest
+# Minecraft protocol (currently 0.16.0+mc26.2), which the crates.io 0.16
+# release (mc26.1) does not yet carry. Cargo.lock pins the exact commit.
+azalea-protocol = { git = "https://github.com/azalea-rs/azalea" }
+azalea-auth = { git = "https://github.com/azalea-rs/azalea" }
+azalea-crypto = { git = "https://github.com/azalea-rs/azalea" }
+azalea-buf = { git = "https://github.com/azalea-rs/azalea" }
+azalea-chat = { git = "https://github.com/azalea-rs/azalea" }
+azalea-core = { git = "https://github.com/azalea-rs/azalea", features = ["bevy_ecs"] }
+azalea-entity = { git = "https://github.com/azalea-rs/azalea" }
+azalea-registry = { git = "https://github.com/azalea-rs/azalea" }
+azalea-inventory = { git = "https://github.com/azalea-rs/azalea" }
 # same crate/version azalea-client uses to locate ~/.minecraft, so the
 # proxy's auth cache path is identical to Account::microsoft's
 minecraft_folder_path = "0.1.2"

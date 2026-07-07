@@ -50,8 +50,8 @@ ClientBuilder::new()
 
 Spectate by adding a vanilla-client server entry for the same address
 (default `127.0.0.1:25566`; `.bind("127.0.0.1:0")` picks a free port).
-The client must be on the same protocol version as the azalea release
-this crate builds against. A standalone binary (`cargo run`, configured
+The client must be on the same protocol version as the azalea git
+revision this crate builds against. A standalone binary (`cargo run`, configured
 via `PROXY_EMAIL` / `PROXY_TARGET` / `PROXY_BIND` / `PROXY_AUTH_CACHE`
 env vars) wraps the same builder.
 
@@ -176,7 +176,7 @@ is aligned on handoff, but momentum is not carried over.
   (`noLimbo: true`); a limbo lobby only matters for its standalone
   public-server mode.
 - `version` option — the protocol version is pinned by the azalea
-  release this crate builds against.
+  git revision this crate builds against.
 - Physics simulation while uncontrolled — the original hosts a
   mineflayer bot in-process and re-enables its physics; here the bot
   is your own azalea process, so the proxy stands in (keepalives +
