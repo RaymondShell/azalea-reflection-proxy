@@ -654,9 +654,15 @@ impl Session {
             // Update our pose snapshot from this movement (needs the frame
             // before it's consumed by the pipeline below).
             let moved = reflect::apply_controller_move(&mut self.pose, &frame);
-            if moved {
-                // note activity so the idle heartbeat only fires when the
-                // bot has actually gone quiet
+            // Only a POSITION packet keeps Hypixel's position stream alive. A
+            // rotation-only packet — the bot aiming at a mob while standing in
+            // melee — carries no position, so the stream is still silent and
+            // the idle heartbeat must fire. Counting rotation as "moved" was
+            // why a bot fighting in place still got Limbo'd.
+            if matches!(
+                frame.packet_id,
+                ids::SB_GAME_MOVE_PLAYER_POS | ids::SB_GAME_MOVE_PLAYER_POS_ROT
+            ) {
                 self.controller_moved_recently = true;
             }
 
