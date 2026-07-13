@@ -1,6 +1,6 @@
 [package]
 name = "azalea-reflection-proxy"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Spectate and take over an azalea bot session live through a local reflection proxy — Rust port of mineflayer-reflection-proxy"
 license = "MIT"
@@ -17,15 +17,15 @@ exclude = [".github/", ".idea/"]
 # version the bot does, and bots built against git are on the newest
 # Minecraft protocol (currently 0.16.0+mc26.2), which the crates.io 0.16
 # release (mc26.1) does not yet carry. Cargo.lock pins the exact commit.
-azalea-protocol = { git = "https://github.com/azalea-rs/azalea" }
-azalea-auth = { git = "https://github.com/azalea-rs/azalea" }
-azalea-crypto = { git = "https://github.com/azalea-rs/azalea" }
-azalea-buf = { git = "https://github.com/azalea-rs/azalea" }
-azalea-chat = { git = "https://github.com/azalea-rs/azalea" }
-azalea-core = { git = "https://github.com/azalea-rs/azalea", features = ["bevy_ecs"] }
-azalea-entity = { git = "https://github.com/azalea-rs/azalea" }
-azalea-registry = { git = "https://github.com/azalea-rs/azalea" }
-azalea-inventory = { git = "https://github.com/azalea-rs/azalea" }
+azalea-protocol = { git = "https://github.com/RaymondShell/azalea" }
+azalea-auth = { git = "https://github.com/RaymondShell/azalea" }
+azalea-crypto = { git = "https://github.com/RaymondShell/azalea" }
+azalea-buf = { git = "https://github.com/RaymondShell/azalea" }
+azalea-chat = { git = "https://github.com/RaymondShell/azalea" }
+azalea-core = { git = "https://github.com/RaymondShell/azalea", features = ["bevy_ecs"] }
+azalea-entity = { git = "https://github.com/RaymondShell/azalea" }
+azalea-registry = { git = "https://github.com/RaymondShell/azalea" }
+azalea-inventory = { git = "https://github.com/RaymondShell/azalea" }
 # same crate/version azalea-client uses to locate ~/.minecraft, so the
 # proxy's auth cache path is identical to Account::microsoft's
 minecraft_folder_path = "0.1.2"
@@ -38,3 +38,8 @@ tracing-subscriber = "0.3"
 async-trait = "0.1"
 uuid = "1.4"
 flate2 = "1.0"
+
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3
