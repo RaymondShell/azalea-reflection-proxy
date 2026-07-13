@@ -89,7 +89,7 @@ pub struct ProxyBuilder {
 impl Default for ProxyBuilder {
     fn default() -> Self {
         Self {
-            bind: "127.0.0.1:25566".into(),
+            bind: "0.0.0.0:25566".into(),
             target_host: "localhost".into(),
             target_port: 25565,
             email: String::new(),

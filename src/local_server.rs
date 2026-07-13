@@ -32,7 +32,7 @@ use tokio::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 
 pub struct LocalServerConfig {
-    pub bind: String, // e.g. "127.0.0.1:25566"
+    pub bind: String, // e.g. "0.0.0.0:25566"
 }
 
 pub struct LocalClient {
