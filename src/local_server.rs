@@ -1,8 +1,9 @@
-//! Local leg: the proxy acting as an offline-mode server on localhost.
+//! Local-facing leg: the proxy acting as an offline-mode server.
 //! The bot connects here with Account::offline("anything") — no Microsoft
 //! auth on this side, because the proxy owns the real session upstream.
 
 use azalea_auth::game_profile::GameProfile;
+use azalea_buf::AzBuf;
 use azalea_chat::FormattedText;
 use azalea_protocol::{
     connect::Connection,
@@ -19,7 +20,7 @@ use azalea_protocol::{
     },
 };
 use eyre::Result;
-use std::sync::Arc;
+use std::{io::Cursor, sync::Arc};
 use tokio::net::{TcpListener, TcpStream};
 
 pub struct LocalServerConfig {
@@ -110,17 +111,11 @@ pub async fn accept_login(stream: TcpStream) -> Result<LocalClient> {
 
             // 4. Send LoginFinished with the UUID (offline clients send a UUID based on their name)
             let uuid = profile_id;
-            conn.write(ClientboundLoginFinished {
-                game_profile: GameProfile {
-                    uuid,
-                    name: username.clone(),
-                    properties: Arc::new(Default::default()),
-                },
-                // mc26.2 added a chat-session UUID here. The proxy owns the
-                // real upstream session and doesn't sign chat on this local
-                // leg, so a nil UUID is the correct neutral value.
-                session_id: uuid::Uuid::nil(),
-            })
+            conn.write(login_finished_packet(GameProfile {
+                uuid,
+                name: username.clone(),
+                properties: Arc::new(Default::default()),
+            })?)
             .await?;
 
             // 5. Wait for LoginAcknowledged
@@ -143,4 +138,18 @@ pub async fn accept_login(stream: TcpStream) -> Result<LocalClient> {
         }
         ClientIntention::Transfer => Err(eyre::eyre!("Transfer intention not supported")),
     }
+}
+
+/// Construct the login-finished packet across Azalea's mc26.1 and mc26.2
+/// layouts. mc26.2 added a trailing chat-session UUID; decoding the common
+/// wire representation lets each selected Azalea version consume the fields
+/// it defines without compile-time field detection.
+fn login_finished_packet(game_profile: GameProfile) -> Result<ClientboundLoginFinished> {
+    let mut encoded = Vec::new();
+    game_profile.azalea_write(&mut encoded)?;
+    uuid::Uuid::nil().azalea_write(&mut encoded)?;
+
+    Ok(ClientboundLoginFinished::azalea_read(&mut Cursor::new(
+        encoded.as_slice(),
+    ))?)
 }
