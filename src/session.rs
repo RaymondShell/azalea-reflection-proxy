@@ -10,12 +10,9 @@
 //! upstream and client sockets talk to it over channels, so there are no
 //! locks on the packet path.
 //!
-//! Mid-session joins need the config-state registry data the server only
-//! sent once, so the session keeps a minimal JoinCache: config frames,
-//! the game Login packet, and the last teleport. That's just enough for
-//! a viewer to reach the game state — chunks/entities/inventory replay
-//! is Phase 3, so until then late viewers spawn over the void and see
-//! only live traffic from their join onward.
+//! Mid-session joins need state the server only sent once, so JoinCache
+//! retains configuration, login/position, loaded chunks, and a normalized
+//! snapshot of current world/player state for replay.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,7 +41,7 @@ use crate::ids;
 use crate::local_server::LocalClient;
 use crate::plugin::{Frame, Pipeline};
 use crate::reflect::{self, BotPose};
-use crate::relay::{AzaleaFrameSink, AzaleaFrameSource, FrameSink, FrameSource};
+use crate::relay::{AzaleaFrameSink, AzaleaFrameSource};
 use crate::upstream::Upstream;
 
 pub type ClientId = u32;
@@ -111,6 +108,12 @@ struct JoinCache {
 }
 
 impl JoinCache {
+    fn new(bot_uuid: Uuid) -> Self {
+        let mut cache = Self::default();
+        cache.world.set_bot_uuid(bot_uuid);
+        cache
+    }
+
     /// The dimension changed: everything tied to the old world is stale.
     fn on_respawn(&mut self, respawn: Frame) {
         self.respawn = Some(respawn);
@@ -238,8 +241,7 @@ pub fn spawn(
         controller: Some((controller_id, controller.username.clone())),
     });
 
-    let mut cache = JoinCache::default();
-    cache.world.set_bot_uuid(bot_uuid);
+    let cache = JoinCache::new(bot_uuid);
     let session = Session {
         pipeline,
         upstream_tx,
@@ -303,8 +305,8 @@ pub async fn attach_viewer(
 /// Game mode and player entity id of the session player, from the
 /// Login packet.
 fn login_info(f: &Frame) -> (Option<u8>, Option<i32>) {
-    use azalea_protocol::packets::ProtocolPacket;
     use azalea_protocol::packets::game::ClientboundGamePacket;
+    use azalea_protocol::packets::ProtocolPacket;
     use std::io::Cursor;
     match ClientboundGamePacket::read(f.packet_id, &mut Cursor::new(&f.body[..])) {
         Ok(ClientboundGamePacket::Login(l)) => {
@@ -318,11 +320,15 @@ fn start_upstream_io(upstream: Upstream, msg_tx: mpsc::Sender<SessionMsg>) -> mp
     let (read, write) = upstream.connection.into_split_raw();
     let (tx, mut rx) = mpsc::channel::<Frame>(1024);
 
+    let writer_msg_tx = msg_tx.clone();
     tokio::spawn(async move {
         let mut sink = AzaleaFrameSink { writer: write };
         while let Some(f) = rx.recv().await {
             if let Err(e) = sink.write_frame(f).await {
                 tracing::warn!("upstream write failed: {e:#}");
+                let _ = writer_msg_tx
+                    .send(SessionMsg::UpstreamClosed(format!("write failed: {e:#}")))
+                    .await;
                 break;
             }
         }
@@ -358,11 +364,13 @@ fn start_client_io(
 ) {
     let (read, write) = conn.into_split_raw();
 
+    let writer_msg_tx = msg_tx.clone();
     tokio::spawn(async move {
         let mut sink = AzaleaFrameSink { writer: write };
         while let Some(f) = frame_rx.recv().await {
             if let Err(e) = sink.write_frame(f).await {
                 tracing::debug!("client {id} write failed: {e:#}");
+                let _ = writer_msg_tx.send(SessionMsg::Detach(id)).await;
                 break;
             }
         }
@@ -428,7 +436,7 @@ impl Session {
             let id = f.packet_id;
             self.observe_clientbound(&f);
             self.stand_in(&f).await;
-            self.broadcast(f).await;
+            self.broadcast(f);
             // Login/Respawn reset client game modes — re-spectator every
             // viewer AFTER they processed the reset
             if matches!(self.upstream_state, UpstreamState::Game)
@@ -599,7 +607,7 @@ impl Session {
                         // stale. Live viewers follow the transition like
                         // the controller does (their acks are swallowed).
                         self.upstream_state = UpstreamState::Config;
-                        self.cache = JoinCache::default();
+                        self.cache = JoinCache::new(self.bot_uuid);
                     }
                     _ => {}
                 }
@@ -714,7 +722,11 @@ impl Session {
                 (c.uuid, c.username.clone())
             };
             queue.extend(reflect::viewer_kit(uuid, &name, self.real_game_mode));
-            queue.extend(reflect::reflected_bundle(self.bot_uuid, &self.bot_name, &self.pose));
+            queue.extend(reflect::reflected_bundle(
+                self.bot_uuid,
+                &self.bot_name,
+                &self.pose,
+            ));
             let c = self.clients.get_mut(&id).expect("checked above");
             let mut ok = true;
             for f in queue {
@@ -728,6 +740,13 @@ impl Session {
                 tracing::info!("viewer {id} ('{}') is live", c.username);
             } else {
                 self.drop_client(id, "queue overflow during join");
+            }
+            if ok
+                && self.controller.is_none()
+                && self.opts.always_first_control
+                && self.promote_to_controller(id)
+            {
+                self.feedback(id, "you have control now (always_first_control)");
             }
         }
         Ok(())
@@ -753,15 +772,36 @@ impl Session {
                     self.demote_to_spectator(old);
                     self.feedback(old, "your control was taken by another client");
                 }
-                self.promote_to_controller(id);
-                self.feedback(id, "you have control now");
+                if self.promote_to_controller(id) {
+                    self.feedback(id, "you have control now");
+                }
             }
             ",release" => {
                 if Some(id) == self.controller {
                     self.controller = None;
                     self.demote_to_spectator(id);
-                    self.feedback(id, "control released; proxy is keeping the session alive");
-                    let _ = self.events.send(ProxyEvent::ControlChanged { controller: None });
+                    if self.opts.always_first_control {
+                        if let Some(next) = self.promote_oldest_live(Some(id)) {
+                            self.feedback(id, "control released to the oldest viewer");
+                            self.feedback(
+                                next,
+                                "another client released control — you have control now",
+                            );
+                        } else {
+                            self.feedback(
+                                id,
+                                "control released; proxy is keeping the session alive",
+                            );
+                            let _ = self
+                                .events
+                                .send(ProxyEvent::ControlChanged { controller: None });
+                        }
+                    } else {
+                        self.feedback(id, "control released; proxy is keeping the session alive");
+                        let _ = self
+                            .events
+                            .send(ProxyEvent::ControlChanged { controller: None });
+                    }
                 } else {
                     self.feedback(id, "you are not the controller");
                 }
@@ -814,9 +854,14 @@ impl Session {
         // id when releasing (the viewer's client uses the bot's Login
         // player id as its own entity id)
         let camera_id = new_target.unwrap_or_else(|| self.real_player_id.unwrap_or(target));
-        if let Some(c) = self.clients.get_mut(&id) {
-            let _ = c.tx.try_send(reflect::camera_frame(camera_id));
-            c.camera_target = new_target;
+        if self.queue_frames(
+            id,
+            [reflect::camera_frame(camera_id)],
+            "queue overflow while changing camera",
+        ) {
+            if let Some(c) = self.clients.get_mut(&id) {
+                c.camera_target = new_target;
+            }
         }
         self.feedback(
             id,
@@ -841,14 +886,16 @@ impl Session {
             "2" | "adventure" => 2,
             "3" | "spectator" => 3,
             _ => {
-                self.feedback(id, "usage: ,gamemode <survival|creative|adventure|spectator|0-3>");
+                self.feedback(
+                    id,
+                    "usage: ,gamemode <survival|creative|adventure|spectator|0-3>",
+                );
                 return;
             }
         };
         if let Some(c) = self.clients.get(&id) {
-            for f in reflect::gamemode_kit(c.uuid, &c.username, mode) {
-                let _ = c.tx.try_send(f);
-            }
+            let frames = reflect::gamemode_kit(c.uuid, &c.username, mode);
+            self.queue_frames(id, frames, "queue overflow while changing game mode");
         }
         self.feedback(id, "client-side game mode updated");
     }
@@ -868,42 +915,44 @@ impl Session {
         };
         let mut frames = reflect::viewer_kit(c.uuid, &c.username, self.real_game_mode);
         frames.extend(self.cache.world.self_hud_frames());
-        frames.extend(reflect::reflected_bundle(self.bot_uuid, &self.bot_name, &self.pose));
-        let c = self.clients.get_mut(&id).expect("checked above");
-        for f in frames {
-            let _ = c.tx.try_send(f);
+        frames.extend(reflect::reflected_bundle(
+            self.bot_uuid,
+            &self.bot_name,
+            &self.pose,
+        ));
+        if self.queue_frames(id, frames, "queue overflow while becoming a viewer") {
+            if let Some(c) = self.clients.get_mut(&id) {
+                c.camera_target = None;
+            }
         }
-        c.camera_target = None;
     }
 
     /// Turn a viewer into the controller: real game mode + abilities
     /// back, ghost entity gone, client teleported onto the bot so its
     /// movement continues from the right place (GrimAC-style alignment).
-    fn promote_to_controller(&mut self, id: ClientId) {
+    fn promote_to_controller(&mut self, id: ClientId) -> bool {
         let Some(c) = self.clients.get(&id) else {
-            return;
+            return false;
         };
-        let mut frames = reflect::controller_kit(c.uuid, &c.username, self.real_game_mode);
+        let uuid = c.uuid;
+        let username = c.username.clone();
+        let mut frames = reflect::controller_kit(uuid, &username, self.real_game_mode);
         frames.extend(self.abilities.iter().cloned());
         let teleport = reflect::handoff_teleport_frame(&self.pose);
         let has_teleport = teleport.is_some();
         frames.extend(teleport);
-        for f in frames {
-            let _ = c.tx.try_send(f);
+        if !self.queue_frames(id, frames, "queue overflow while acquiring control") {
+            return false;
         }
         if let Some(c) = self.clients.get_mut(&id) {
             c.swallow_next_accept = has_teleport;
             c.camera_target = None; // controller drives its own camera
         }
         self.controller = Some(id);
-        let username = self
-            .clients
-            .get(&id)
-            .map(|c| c.username.clone())
-            .unwrap_or_default();
         let _ = self.events.send(ProxyEvent::ControlChanged {
             controller: Some((id, username)),
         });
+        true
     }
 
     /// Re-send the viewer kit to every Live viewer after a Login /
@@ -922,11 +971,10 @@ impl Session {
         for (cid, uuid, name) in viewers {
             let mut frames = reflect::viewer_kit(uuid, &name, self.real_game_mode);
             frames.extend(self.cache.world.self_hud_frames());
-            if let Some(c) = self.clients.get_mut(&cid) {
-                for f in frames {
-                    let _ = c.tx.try_send(f);
+            if self.queue_frames(cid, frames, "queue overflow while resetting viewer") {
+                if let Some(c) = self.clients.get_mut(&cid) {
+                    c.camera_target = None;
                 }
-                c.camera_target = None;
             }
         }
     }
@@ -935,7 +983,13 @@ impl Session {
         if let Some(max) = self.opts.max_clients {
             if self.clients.len() >= max {
                 tracing::info!("refusing viewer {id} ('{username}'): max_clients={max} reached");
-                // dropping tx closes the writer and the socket
+                use azalea_chat::FormattedText;
+                use azalea_protocol::packets::config::c_disconnect::ClientboundDisconnect;
+                let _ = tx.try_send(ids::frame_of(ClientboundDisconnect {
+                    reason: FormattedText::from("this proxy has reached its client limit"),
+                }));
+                // Dropping tx after the queued disconnect closes the writer
+                // and socket once the message has been sent.
                 return;
             }
         }
@@ -1036,7 +1090,7 @@ impl Session {
     /// that overflows its large buffer is hopelessly behind, so it's
     /// dropped (clean session end) rather than allowed to freeze the
     /// session; frames are never silently lost, only whole clients.
-    async fn broadcast(&mut self, frame: Frame) {
+    fn broadcast(&mut self, frame: Frame) {
         // The server can echo the bot's own body as a real entity carrying
         // the bot's uuid (Hypixel does this across lobby switches). NO local
         // client should see it: a viewer has the synthesized reflected entity
@@ -1098,15 +1152,10 @@ impl Session {
             if self.opts.always_first_control {
                 // the original's alwaysFirstControl: oldest live client
                 // inherits control immediately
-                let oldest = self
-                    .clients
-                    .iter()
-                    .filter(|(_, c)| matches!(c.state, ClientState::Live))
-                    .map(|(&cid, _)| cid)
-                    .min();
-                if let Some(next) = oldest {
-                    tracing::info!("controller left; promoting client {next} (always_first_control)");
-                    self.promote_to_controller(next);
+                if let Some(next) = self.promote_oldest_live(None) {
+                    tracing::info!(
+                        "controller left; promoting client {next} (always_first_control)"
+                    );
                     self.feedback(next, "previous controller left — you have control now");
                     return;
                 }
@@ -1114,7 +1163,47 @@ impl Session {
             // session survives controllerless: stand_in() takes over
             // keepalives/teleports until someone runs ,acquire
             tracing::info!("controller left; session is now controllerless (use ,acquire)");
-            let _ = self.events.send(ProxyEvent::ControlChanged { controller: None });
+            let _ = self
+                .events
+                .send(ProxyEvent::ControlChanged { controller: None });
+        }
+    }
+
+    fn oldest_live_client(&self, exclude: Option<ClientId>) -> Option<ClientId> {
+        self.clients
+            .iter()
+            .filter(|(cid, c)| Some(**cid) != exclude && matches!(c.state, ClientState::Live))
+            .map(|(&cid, _)| cid)
+            .min()
+    }
+
+    fn promote_oldest_live(&mut self, exclude: Option<ClientId>) -> Option<ClientId> {
+        while let Some(id) = self.oldest_live_client(exclude) {
+            if self.promote_to_controller(id) {
+                return Some(id);
+            }
+            // A failed promotion drops that client; try the next one.
+        }
+        None
+    }
+
+    fn queue_frames(
+        &mut self,
+        id: ClientId,
+        frames: impl IntoIterator<Item = Frame>,
+        failure_reason: &str,
+    ) -> bool {
+        let Some(client) = self.clients.get(&id) else {
+            return false;
+        };
+        if frames
+            .into_iter()
+            .any(|frame| client.tx.try_send(frame).is_err())
+        {
+            self.drop_client(id, failure_reason);
+            false
+        } else {
+            true
         }
     }
 }

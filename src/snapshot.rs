@@ -9,23 +9,18 @@
 //! accumulation are parsed (typed reads for small packets, leading
 //! varints for entity-indexed ones whose bodies we don't care about).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
 use azalea_buf::AzBufVar;
 use azalea_core::entity_id::MinecraftEntityId;
-use azalea_core::position::Vec3;
+use azalea_core::position::{BlockPos, Vec3};
 use azalea_entity::LookDirection;
 use azalea_protocol::packets::game::c_player_info_update::PlayerInfoEntry;
 use uuid::Uuid;
 
 use crate::ids::{self, frame_of};
 use crate::plugin::Frame;
-
-/// Per-entity ceiling on stored metadata delta frames; oldest dropped.
-const MAX_METADATA_FRAMES: usize = 16;
-/// Ceiling on inventory slot-delta frames since the last full content.
-const MAX_SLOT_FRAMES: usize = 64;
 
 #[derive(Default)]
 pub struct WorldSnapshot {
@@ -39,10 +34,15 @@ pub struct WorldSnapshot {
     /// Merged tab-list entries by uuid.
     players: HashMap<Uuid, PlayerInfoEntry>,
     objectives: HashMap<String, Frame>,
-    displays: HashMap<u8, Frame>,
+    displays: HashMap<u8, (String, Frame)>,
     scores: HashMap<(String, String), Frame>,
-    /// Team base frame (Add/Change) plus subsequent membership deltas.
-    teams: HashMap<String, Vec<Frame>>,
+    teams: HashMap<String, TeamRecord>,
+    /// Block changes since each cached full chunk packet. These are
+    /// normalized to one latest BlockUpdate per position, so long-running
+    /// redstone activity stays bounded by the number of changed blocks.
+    block_updates: HashMap<BlockPos, (u64, Frame)>,
+    block_entities: HashMap<BlockPos, (u64, Frame)>,
+    block_sequence: u64,
     time: Option<Frame>,
     experience: Option<Frame>,
     health: Option<Frame>,
@@ -50,7 +50,8 @@ pub struct WorldSnapshot {
     held_slot: Option<Frame>,
     /// Full player-inventory content + slot deltas since.
     inventory_content: Option<Frame>,
-    inventory_slots: Vec<Frame>,
+    inventory_slots: HashMap<u16, (u64, Frame)>,
+    inventory_sequence: u64,
     /// Per-slot `set_player_inventory` (1.21.2+): the modern packet the
     /// server uses to populate the player's own inventory and hotbar
     /// outside a container screen. Keyed by slot so the latest wins.
@@ -64,6 +65,7 @@ pub struct WorldSnapshot {
     /// makes the vanilla client dereference a null map entry and
     /// disconnect — we replay a synthesized Add for each on join.
     boss_bars: HashMap<Uuid, BossBar>,
+    passengers: HashMap<i32, Frame>,
 }
 
 /// Accumulated state of one boss bar, enough to rebuild its Add.
@@ -74,6 +76,11 @@ struct BossBar {
     properties: azalea_protocol::packets::game::c_boss_event::Properties,
 }
 
+struct TeamRecord {
+    parameters: azalea_protocol::packets::game::c_set_player_team::Parameters,
+    players: HashSet<String>,
+}
+
 struct EntityRecord {
     add: Frame,
     uuid: Uuid,
@@ -82,9 +89,15 @@ struct EntityRecord {
     look: (i8, i8),
     head_rot: i8,
     on_ground: bool,
-    metadata: Vec<Frame>,
-    equipment: Option<Frame>,
-    attributes: Option<Frame>,
+    /// Latest value for every metadata index. Keeping raw delta frames with
+    /// a length ceiling either leaked memory or eventually discarded fields
+    /// that had not changed recently.
+    metadata: HashMap<u8, azalea_entity::EntityDataValue>,
+    equipment: HashMap<azalea_inventory::components::EquipmentSlot, azalea_inventory::ItemStack>,
+    attributes: HashMap<
+        azalea_registry::builtin::Attribute,
+        azalea_protocol::packets::game::c_update_attributes::AttributeSnapshot,
+    >,
     /// Keyed by the effect's registry id (second leading varint).
     effects: HashMap<u32, Frame>,
 }
@@ -140,6 +153,10 @@ impl WorldSnapshot {
     /// player list, scoreboards, inventory and vitals persist.
     pub fn on_respawn(&mut self) {
         self.entities.clear();
+        self.block_updates.clear();
+        self.block_entities.clear();
+        self.block_sequence = 0;
+        self.passengers.clear();
         self.rain = None;
         self.rain_level = None;
         self.thunder_level = None;
@@ -147,13 +164,65 @@ impl WorldSnapshot {
 
     /// Feed every game-state clientbound frame through here.
     pub fn observe(&mut self, f: &Frame) {
-        use azalea_protocol::packets::ProtocolPacket;
         use azalea_protocol::packets::game::ClientboundGamePacket;
+        use azalea_protocol::packets::ProtocolPacket;
 
-        let typed =
-            |f: &Frame| ClientboundGamePacket::read(f.packet_id, &mut Cursor::new(&f.body[..])).ok();
+        let typed = |f: &Frame| {
+            ClientboundGamePacket::read(f.packet_id, &mut Cursor::new(&f.body[..])).ok()
+        };
 
         match f.packet_id {
+            ids::CB_GAME_LEVEL_CHUNK_WITH_LIGHT | ids::CB_GAME_FORGET_LEVEL_CHUNK => {
+                let chunk = if f.packet_id == ids::CB_GAME_LEVEL_CHUNK_WITH_LIGHT {
+                    ids::chunk_key(&f.body)
+                } else {
+                    ids::forget_chunk_key(&f.body)
+                };
+                if let Some((x, z)) = chunk {
+                    self.block_updates
+                        .retain(|pos, _| (pos.x >> 4, pos.z >> 4) != (x, z));
+                    self.block_entities
+                        .retain(|pos, _| (pos.x >> 4, pos.z >> 4) != (x, z));
+                }
+            }
+            ids::CB_GAME_BLOCK_UPDATE => {
+                if let Some(ClientboundGamePacket::BlockUpdate(p)) = typed(f) {
+                    self.block_sequence = self.block_sequence.wrapping_add(1);
+                    self.block_updates
+                        .insert(p.pos, (self.block_sequence, f.clone()));
+                }
+            }
+            ids::CB_GAME_SECTION_BLOCKS_UPDATE => {
+                use azalea_protocol::packets::game::c_block_update::ClientboundBlockUpdate;
+
+                if let Some(ClientboundGamePacket::SectionBlocksUpdate(p)) = typed(f) {
+                    for update in p.states {
+                        let pos = BlockPos {
+                            x: p.section_pos.x * 16 + i32::from(update.pos.x),
+                            y: p.section_pos.y * 16 + i32::from(update.pos.y),
+                            z: p.section_pos.z * 16 + i32::from(update.pos.z),
+                        };
+                        self.block_sequence = self.block_sequence.wrapping_add(1);
+                        self.block_updates.insert(
+                            pos,
+                            (
+                                self.block_sequence,
+                                frame_of(ClientboundBlockUpdate {
+                                    pos,
+                                    block_state: update.state,
+                                }),
+                            ),
+                        );
+                    }
+                }
+            }
+            ids::CB_GAME_BLOCK_ENTITY_DATA => {
+                if let Some(ClientboundGamePacket::BlockEntityData(p)) = typed(f) {
+                    self.block_sequence = self.block_sequence.wrapping_add(1);
+                    self.block_entities
+                        .insert(p.pos, (self.block_sequence, f.clone()));
+                }
+            }
             ids::CB_GAME_ADD_ENTITY => {
                 if let Some(ClientboundGamePacket::AddEntity(p)) = typed(f) {
                     // never store the bot's own body — the reflected entity
@@ -171,9 +240,9 @@ impl WorldSnapshot {
                             look: (p.y_rot, p.x_rot),
                             head_rot: p.y_head_rot,
                             on_ground: false,
-                            metadata: Vec::new(),
-                            equipment: None,
-                            attributes: None,
+                            metadata: HashMap::new(),
+                            equipment: HashMap::new(),
+                            attributes: HashMap::new(),
                             effects: HashMap::new(),
                         },
                     );
@@ -183,6 +252,7 @@ impl WorldSnapshot {
                 if let Some(ClientboundGamePacket::RemoveEntities(p)) = typed(f) {
                     for id in p.entity_ids {
                         self.entities.remove(&id.0);
+                        self.passengers.remove(&id.0);
                     }
                 }
             }
@@ -230,9 +300,34 @@ impl WorldSnapshot {
             ids::CB_GAME_TELEPORT_ENTITY => {
                 if let Some(ClientboundGamePacket::TeleportEntity(p)) = typed(f) {
                     if let Some(e) = self.entities.get_mut(&p.id.0) {
-                        if !p.relative.x && !p.relative.y && !p.relative.z {
-                            e.pos = p.change.pos;
-                        }
+                        e.pos = Vec3::new(
+                            if p.relative.x {
+                                e.pos.x + p.change.pos.x
+                            } else {
+                                p.change.pos.x
+                            },
+                            if p.relative.y {
+                                e.pos.y + p.change.pos.y
+                            } else {
+                                p.change.pos.y
+                            },
+                            if p.relative.z {
+                                e.pos.z + p.change.pos.z
+                            } else {
+                                p.change.pos.z
+                            },
+                        );
+                        let y_rot = if p.relative.y_rot {
+                            degrees(e.look.0) + p.change.look_direction.y_rot()
+                        } else {
+                            p.change.look_direction.y_rot()
+                        };
+                        let x_rot = if p.relative.x_rot {
+                            degrees(e.look.1) + p.change.look_direction.x_rot()
+                        } else {
+                            p.change.look_direction.x_rot()
+                        };
+                        e.look = (compact_angle(y_rot), compact_angle(x_rot));
                         e.on_ground = p.on_ground;
                     }
                 }
@@ -245,26 +340,29 @@ impl WorldSnapshot {
                 }
             }
             ids::CB_GAME_SET_ENTITY_DATA => {
-                if let Some(id) = leading_varint(&f.body) {
-                    if let Some(e) = self.entities.get_mut(&(id as i32)) {
-                        if e.metadata.len() >= MAX_METADATA_FRAMES {
-                            e.metadata.remove(0);
+                if let Some(ClientboundGamePacket::SetEntityData(p)) = typed(f) {
+                    if let Some(e) = self.entities.get_mut(&p.id.0) {
+                        for item in p.packed_items.0 {
+                            e.metadata.insert(item.index, item.value);
                         }
-                        e.metadata.push(f.clone());
                     }
                 }
             }
             ids::CB_GAME_SET_EQUIPMENT => {
-                if let Some(id) = leading_varint(&f.body) {
-                    if let Some(e) = self.entities.get_mut(&(id as i32)) {
-                        e.equipment = Some(f.clone());
+                if let Some(ClientboundGamePacket::SetEquipment(p)) = typed(f) {
+                    if let Some(e) = self.entities.get_mut(&p.entity_id.0) {
+                        for (slot, item) in p.slots.slots {
+                            e.equipment.insert(slot, item);
+                        }
                     }
                 }
             }
             ids::CB_GAME_UPDATE_ATTRIBUTES => {
-                if let Some(id) = leading_varint(&f.body) {
-                    if let Some(e) = self.entities.get_mut(&(id as i32)) {
-                        e.attributes = Some(f.clone());
+                if let Some(ClientboundGamePacket::UpdateAttributes(p)) = typed(f) {
+                    if let Some(e) = self.entities.get_mut(&p.entity_id.0) {
+                        for value in p.values {
+                            e.attributes.insert(value.attribute, value);
+                        }
                     }
                 }
             }
@@ -326,6 +424,7 @@ impl WorldSnapshot {
                         Method::Remove => {
                             self.objectives.remove(&p.objective_name);
                             self.scores.retain(|(obj, _), _| obj != &p.objective_name);
+                            self.displays.retain(|_, (obj, _)| obj != &p.objective_name);
                         }
                         // Store every objective as an Add. A mid-session
                         // viewer needs the Add to CREATE the objective; a
@@ -362,7 +461,12 @@ impl WorldSnapshot {
             }
             ids::CB_GAME_SET_DISPLAY_OBJECTIVE => {
                 if let Some(ClientboundGamePacket::SetDisplayObjective(p)) = typed(f) {
-                    self.displays.insert(p.slot as u8, f.clone());
+                    if p.objective_name.is_empty() {
+                        self.displays.remove(&(p.slot as u8));
+                    } else {
+                        self.displays
+                            .insert(p.slot as u8, (p.objective_name, f.clone()));
+                    }
                 }
             }
             ids::CB_GAME_SET_SCORE => {
@@ -387,17 +491,38 @@ impl WorldSnapshot {
                         Method::Remove => {
                             self.teams.remove(&p.name);
                         }
-                        Method::Add(_) => {
-                            self.teams.insert(p.name, vec![f.clone()]);
+                        Method::Add((parameters, players)) => {
+                            self.teams.insert(
+                                p.name,
+                                TeamRecord {
+                                    parameters,
+                                    players: players.into_iter().collect(),
+                                },
+                            );
                         }
-                        _ => {
-                            if let Some(frames) = self.teams.get_mut(&p.name) {
-                                if frames.len() < 32 {
-                                    frames.push(f.clone());
+                        Method::Change(parameters) => {
+                            if let Some(team) = self.teams.get_mut(&p.name) {
+                                team.parameters = parameters;
+                            }
+                        }
+                        Method::Join(players) => {
+                            if let Some(team) = self.teams.get_mut(&p.name) {
+                                team.players.extend(players);
+                            }
+                        }
+                        Method::Leave(players) => {
+                            if let Some(team) = self.teams.get_mut(&p.name) {
+                                for player in players {
+                                    team.players.remove(&player);
                                 }
                             }
                         }
                     }
+                }
+            }
+            ids::CB_GAME_SET_PASSENGERS => {
+                if let Some(ClientboundGamePacket::SetPassengers(p)) = typed(f) {
+                    self.passengers.insert(p.vehicle.0, f.clone());
                 }
             }
             ids::CB_GAME_SET_TIME => self.time = Some(f.clone()),
@@ -407,16 +532,21 @@ impl WorldSnapshot {
             ids::CB_GAME_SET_HELD_SLOT => self.held_slot = Some(f.clone()),
             ids::CB_GAME_CONTAINER_SET_CONTENT => {
                 // container 0 = the player inventory
-                if leading_varint(&f.body) == Some(0) {
-                    self.inventory_content = Some(f.clone());
-                    self.inventory_slots.clear();
+                if let Some(ClientboundGamePacket::ContainerSetContent(p)) = typed(f) {
+                    if p.container_id == 0 {
+                        self.inventory_content = Some(f.clone());
+                        self.inventory_slots.clear();
+                        self.inventory_sequence = 0;
+                    }
                 }
             }
             ids::CB_GAME_CONTAINER_SET_SLOT => {
-                if leading_varint(&f.body) == Some(0)
-                    && self.inventory_slots.len() < MAX_SLOT_FRAMES
-                {
-                    self.inventory_slots.push(f.clone());
+                if let Some(ClientboundGamePacket::ContainerSetSlot(p)) = typed(f) {
+                    if p.container_id == 0 {
+                        self.inventory_sequence = self.inventory_sequence.wrapping_add(1);
+                        self.inventory_slots
+                            .insert(p.slot, (self.inventory_sequence, f.clone()));
+                    }
                 }
             }
             ids::CB_GAME_SET_PLAYER_INVENTORY => {
@@ -500,14 +630,22 @@ impl WorldSnapshot {
     /// their accumulated positions, then vitals, inventory, scoreboards
     /// and ambience.
     pub fn replay(&self) -> Vec<Frame> {
+        use azalea_entity::{EntityDataItem, EntityMetadataItems};
         use azalea_protocol::common::movements::PositionMoveRotation;
         use azalea_protocol::packets::game::c_entity_position_sync::ClientboundEntityPositionSync;
         use azalea_protocol::packets::game::c_player_info_update::{
             ActionEnumSet, ClientboundPlayerInfoUpdate,
         };
         use azalea_protocol::packets::game::c_rotate_head::ClientboundRotateHead;
+        use azalea_protocol::packets::game::c_set_entity_data::ClientboundSetEntityData;
+        use azalea_protocol::packets::game::c_set_equipment::{
+            ClientboundSetEquipment, EquipmentSlots,
+        };
+        use azalea_protocol::packets::game::c_set_player_team::{ClientboundSetPlayerTeam, Method};
+        use azalea_protocol::packets::game::c_update_attributes::ClientboundUpdateAttributes;
 
         let mut q = Vec::new();
+        q.extend(self.block_change_frames());
         if !self.players.is_empty() {
             q.push(frame_of(ClientboundPlayerInfoUpdate {
                 // update_list_order and update_hat MUST stay false:
@@ -545,23 +683,59 @@ impl WorldSnapshot {
                 entity_id: MinecraftEntityId(*id),
                 y_head_rot: e.head_rot,
             }));
-            q.extend(e.metadata.iter().cloned());
-            q.extend(e.equipment.iter().cloned());
-            q.extend(e.attributes.iter().cloned());
+            if !e.metadata.is_empty() {
+                q.push(frame_of(ClientboundSetEntityData {
+                    id: MinecraftEntityId(*id),
+                    packed_items: EntityMetadataItems(
+                        e.metadata
+                            .iter()
+                            .map(|(&index, value)| EntityDataItem {
+                                index,
+                                value: value.clone(),
+                            })
+                            .collect(),
+                    ),
+                }));
+            }
+            if !e.equipment.is_empty() {
+                q.push(frame_of(ClientboundSetEquipment {
+                    entity_id: MinecraftEntityId(*id),
+                    slots: EquipmentSlots {
+                        slots: e
+                            .equipment
+                            .iter()
+                            .map(|(&slot, item)| (slot, item.clone()))
+                            .collect(),
+                    },
+                }));
+            }
+            if !e.attributes.is_empty() {
+                q.push(frame_of(ClientboundUpdateAttributes {
+                    entity_id: MinecraftEntityId(*id),
+                    values: e.attributes.values().cloned().collect(),
+                }));
+            }
             q.extend(e.effects.values().cloned());
         }
+        q.extend(self.passengers.values().cloned());
         q.extend(self.time.iter().cloned());
         q.extend(self.experience.iter().cloned());
         q.extend(self.health.iter().cloned());
         q.extend(self.held_slot.iter().cloned());
         q.extend(self.inventory_content.iter().cloned());
-        q.extend(self.inventory_slots.iter().cloned());
+        q.extend(self.inventory_slot_frames());
         q.extend(self.player_inventory.values().cloned());
         q.extend(self.objectives.values().cloned());
-        q.extend(self.displays.values().cloned());
+        q.extend(self.displays.values().map(|(_, frame)| frame.clone()));
         q.extend(self.scores.values().cloned());
-        for frames in self.teams.values() {
-            q.extend(frames.iter().cloned());
+        for (name, team) in &self.teams {
+            q.push(frame_of(ClientboundSetPlayerTeam {
+                name: name.clone(),
+                method: Method::Add((
+                    team.parameters.clone(),
+                    team.players.iter().cloned().collect(),
+                )),
+            }));
         }
         q.extend(self.tab_list.iter().cloned());
         for (id, b) in &self.boss_bars {
@@ -594,11 +768,27 @@ impl WorldSnapshot {
         let mut q = Vec::new();
         q.extend(self.held_slot.iter().cloned());
         q.extend(self.inventory_content.iter().cloned());
-        q.extend(self.inventory_slots.iter().cloned());
+        q.extend(self.inventory_slot_frames());
         q.extend(self.player_inventory.values().cloned());
         q.extend(self.health.iter().cloned());
         q.extend(self.experience.iter().cloned());
         q
+    }
+
+    fn inventory_slot_frames(&self) -> Vec<Frame> {
+        let mut frames: Vec<_> = self.inventory_slots.values().collect();
+        frames.sort_unstable_by_key(|(sequence, _)| *sequence);
+        frames.into_iter().map(|(_, frame)| frame.clone()).collect()
+    }
+
+    fn block_change_frames(&self) -> Vec<Frame> {
+        let mut frames: Vec<_> = self
+            .block_updates
+            .values()
+            .chain(self.block_entities.values())
+            .collect();
+        frames.sort_unstable_by_key(|(sequence, _)| *sequence);
+        frames.into_iter().map(|(_, frame)| frame.clone()).collect()
     }
 }
 
@@ -634,6 +824,25 @@ mod tests {
         })
     }
 
+    fn entity_frame(id: i32, uuid: Uuid) -> Frame {
+        use azalea_core::delta::LpVec3;
+        use azalea_core::entity_id::MinecraftEntityId;
+        use azalea_protocol::packets::game::c_add_entity::ClientboundAddEntity;
+        use azalea_registry::builtin::EntityKind;
+
+        frame_of(ClientboundAddEntity {
+            id: MinecraftEntityId(id),
+            uuid,
+            entity_type: EntityKind::Player,
+            position: Vec3::default(),
+            movement: LpVec3::Zero,
+            x_rot: 0,
+            y_rot: 0,
+            y_head_rot: 0,
+            data: 0,
+        })
+    }
+
     /// A viewer that missed the Add must still get one on join, carrying
     /// the latest name from subsequent Update operations — the exact gap
     /// that NPE-crashed the client on a bare UpdateName.
@@ -642,7 +851,10 @@ mod tests {
         let id = Uuid::from_u128(7);
         let mut snap = WorldSnapshot::default();
         snap.observe(&boss_frame(id, add_op("Wither")));
-        snap.observe(&boss_frame(id, Operation::UpdateName(FormattedText::from("Ender Dragon"))));
+        snap.observe(&boss_frame(
+            id,
+            Operation::UpdateName(FormattedText::from("Ender Dragon")),
+        ));
         snap.observe(&boss_frame(id, Operation::UpdateProgress(0.5)));
 
         let bars: Vec<_> = snap
@@ -671,32 +883,13 @@ mod tests {
     /// "Duplicate entity UUID" on the viewer.
     #[test]
     fn snapshot_skips_bot_own_entity() {
-        use azalea_core::delta::LpVec3;
-        use azalea_core::entity_id::MinecraftEntityId;
-        use azalea_core::position::Vec3;
-        use azalea_protocol::packets::game::c_add_entity::ClientboundAddEntity;
-        use azalea_registry::builtin::EntityKind;
-
         let bot = Uuid::from_u128(0xB07);
         let other = Uuid::from_u128(0x07);
-        let add = |id: i32, uuid: Uuid| {
-            frame_of(ClientboundAddEntity {
-                id: MinecraftEntityId(id),
-                uuid,
-                entity_type: EntityKind::Player,
-                position: Vec3::default(),
-                movement: LpVec3::Zero,
-                x_rot: 0,
-                y_rot: 0,
-                y_head_rot: 0,
-                data: 0,
-            })
-        };
 
         let mut snap = WorldSnapshot::default();
         snap.set_bot_uuid(bot);
-        snap.observe(&add(5, bot)); // skipped
-        snap.observe(&add(6, other)); // kept
+        snap.observe(&entity_frame(5, bot)); // skipped
+        snap.observe(&entity_frame(6, other)); // kept
 
         let uuids: Vec<Uuid> = snap
             .replay()
@@ -710,6 +903,77 @@ mod tests {
             .collect();
         assert!(!uuids.contains(&bot));
         assert!(uuids.contains(&other));
+    }
+
+    #[test]
+    fn metadata_updates_merge_by_index() {
+        use azalea_core::entity_id::MinecraftEntityId;
+        use azalea_entity::{EntityDataItem, EntityDataValue, EntityMetadataItems};
+        use azalea_protocol::packets::game::c_set_entity_data::ClientboundSetEntityData;
+
+        let mut snap = WorldSnapshot::default();
+        snap.observe(&entity_frame(7, Uuid::from_u128(7)));
+        let metadata = |items| {
+            frame_of(ClientboundSetEntityData {
+                id: MinecraftEntityId(7),
+                packed_items: EntityMetadataItems(items),
+            })
+        };
+        snap.observe(&metadata(vec![EntityDataItem {
+            index: 0,
+            value: EntityDataValue::Byte(1),
+        }]));
+        snap.observe(&metadata(vec![
+            EntityDataItem {
+                index: 0,
+                value: EntityDataValue::Byte(2),
+            },
+            EntityDataItem {
+                index: 1,
+                value: EntityDataValue::Int(3),
+            },
+        ]));
+
+        let packet = snap.replay().into_iter().find_map(|f| {
+            match ClientboundGamePacket::read(f.packet_id, &mut Cursor::new(&f.body[..])) {
+                Ok(ClientboundGamePacket::SetEntityData(p)) => Some(p),
+                _ => None,
+            }
+        });
+        let packet = packet.expect("metadata should be replayed");
+        assert_eq!(packet.packed_items.0.len(), 2);
+        assert!(packet.packed_items.0.contains(&EntityDataItem {
+            index: 0,
+            value: EntityDataValue::Byte(2),
+        }));
+    }
+
+    #[test]
+    fn inventory_slot_cache_keeps_the_latest_update() {
+        use azalea_inventory::ItemStack;
+        use azalea_protocol::packets::game::c_container_set_slot::ClientboundContainerSetSlot;
+
+        let mut snap = WorldSnapshot::default();
+        for state_id in 0..100 {
+            snap.observe(&frame_of(ClientboundContainerSetSlot {
+                container_id: 0,
+                state_id,
+                slot: 5,
+                item_stack: ItemStack::Empty,
+            }));
+        }
+        let slots: Vec<_> = snap
+            .replay()
+            .into_iter()
+            .filter_map(|f| {
+                match ClientboundGamePacket::read(f.packet_id, &mut Cursor::new(&f.body[..])) {
+                    Ok(ClientboundGamePacket::ContainerSetSlot(p)) => Some(p),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].state_id, 99);
     }
 
     #[test]
@@ -743,11 +1007,13 @@ mod tests {
                 signature: Some("some-signature".to_string()),
             },
         );
-        let mut entry = PlayerInfoEntry::default();
-        entry.profile = GameProfile {
-            uuid: Uuid::from_u128(1),
-            name: "Player".to_string(),
-            properties: Arc::new(props),
+        let entry = PlayerInfoEntry {
+            profile: GameProfile {
+                uuid: Uuid::from_u128(1),
+                name: "Player".to_string(),
+                properties: Arc::new(props),
+            },
+            ..PlayerInfoEntry::default()
         };
 
         let stripped = strip_signatures(&entry);
@@ -763,9 +1029,7 @@ mod tests {
     fn objective_change_replays_as_add() {
         use azalea_chat::numbers::NumberFormat;
         use azalea_core::objectives::ObjectiveCriteria;
-        use azalea_protocol::packets::game::c_set_objective::{
-            ClientboundSetObjective, Method,
-        };
+        use azalea_protocol::packets::game::c_set_objective::{ClientboundSetObjective, Method};
 
         let obj = |name: &str, method| {
             frame_of(ClientboundSetObjective {

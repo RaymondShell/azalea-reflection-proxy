@@ -2,34 +2,25 @@
 //! The bot connects here with Account::offline("anything") — no Microsoft
 //! auth on this side, because the proxy owns the real session upstream.
 
+use azalea_auth::game_profile::GameProfile;
+use azalea_chat::FormattedText;
 use azalea_protocol::{
     connect::Connection,
     packets::{
-        ClientIntention,
-        PROTOCOL_VERSION,
-        handshake::{
-            ClientboundHandshakePacket,
-            ServerboundHandshakePacket,
-        },
-        login::{
-            ServerboundLoginPacket,
-            c_login_finished::ClientboundLoginFinished,
-        },
+        config::{ClientboundConfigPacket, ServerboundConfigPacket},
+        handshake::{ClientboundHandshakePacket, ServerboundHandshakePacket},
+        login::{c_login_finished::ClientboundLoginFinished, ServerboundLoginPacket},
         status::{
-            ServerboundStatusPacket,
-            c_status_response::{ClientboundStatusResponse, Players, Version},
             c_pong_response::ClientboundPongResponse,
+            c_status_response::{ClientboundStatusResponse, Players, Version},
+            ServerboundStatusPacket,
         },
-        config::{
-            ClientboundConfigPacket, ServerboundConfigPacket,
-        },
+        ClientIntention, PROTOCOL_VERSION,
     },
 };
-use azalea_auth::game_profile::GameProfile;
-use azalea_chat::FormattedText;
 use eyre::Result;
-use tokio::net::{TcpListener, TcpStream};
 use std::sync::Arc;
+use tokio::net::{TcpListener, TcpStream};
 
 pub struct LocalServerConfig {
     pub bind: String, // e.g. "0.0.0.0:25566"
@@ -57,18 +48,7 @@ pub async fn accept_login(stream: TcpStream) -> Result<LocalClient> {
     // 1. Read handshake
     let packet = conn.read().await?;
 
-    let intention = match packet {
-        ServerboundHandshakePacket::Intention(p) => p,
-    };
-
-    // Verify protocol version
-    if intention.protocol_version != PROTOCOL_VERSION as i32 {
-        return Err(eyre::eyre!(
-            "Protocol version mismatch: client has {}, proxy expects {}",
-            intention.protocol_version,
-            PROTOCOL_VERSION
-        ));
-    }
+    let ServerboundHandshakePacket::Intention(intention) = packet;
 
     match intention.intention {
         ClientIntention::Status => {
@@ -77,38 +57,44 @@ pub async fn accept_login(stream: TcpStream) -> Result<LocalClient> {
 
             // Wait for status request
             let packet = conn.read().await?;
-            match packet {
-                ServerboundStatusPacket::StatusRequest(_) => {
-                    // Send status response with basic info
-                    conn.write(ClientboundStatusResponse {
-                        description: FormattedText::from("Azalea Reflection Proxy"),
-                        favicon: None,
-                        players: Players {
-                            max: 1,
-                            online: 0,
-                            sample: vec![],
-                        },
-                        version: Version {
-                            name: "1.21.3".to_string(),
-                            protocol: PROTOCOL_VERSION as i32,
-                        },
-                        enforces_secure_chat: None,
-                    }).await?;
-                }
-                _ => {}
+            if let ServerboundStatusPacket::StatusRequest(_) = packet {
+                // Send status response with basic info
+                conn.write(ClientboundStatusResponse {
+                    description: FormattedText::from("Azalea Reflection Proxy"),
+                    favicon: None,
+                    players: Players {
+                        max: 1,
+                        online: 0,
+                        sample: vec![],
+                    },
+                    version: Version {
+                        name: "Azalea Reflection Proxy".to_string(),
+                        protocol: PROTOCOL_VERSION,
+                    },
+                    enforces_secure_chat: None,
+                })
+                .await?;
             }
 
             // Handle ping
             let packet = conn.read().await?;
             if let ServerboundStatusPacket::PingRequest(p) = packet {
-                conn.write(ClientboundPongResponse {
-                    time: p.time,
-                }).await?;
+                conn.write(ClientboundPongResponse { time: p.time }).await?;
             }
 
-            return Err(eyre::eyre!("Client performed status ping and disconnected"));
+            Err(eyre::eyre!("Client performed status ping and disconnected"))
         }
         ClientIntention::Login => {
+            // Status requests from other versions still need a response so
+            // the server list can display the incompatibility. Only reject
+            // an actual login attempt.
+            if intention.protocol_version != PROTOCOL_VERSION {
+                return Err(eyre::eyre!(
+                    "Protocol version mismatch: client has {}, proxy expects {}",
+                    intention.protocol_version,
+                    PROTOCOL_VERSION
+                ));
+            }
             // Continue with login
             let mut conn = conn.login();
 
@@ -134,7 +120,8 @@ pub async fn accept_login(stream: TcpStream) -> Result<LocalClient> {
                 // real upstream session and doesn't sign chat on this local
                 // leg, so a nil UUID is the correct neutral value.
                 session_id: uuid::Uuid::nil(),
-            }).await?;
+            })
+            .await?;
 
             // 5. Wait for LoginAcknowledged
             let packet = conn.read().await?;
@@ -154,8 +141,6 @@ pub async fn accept_login(stream: TcpStream) -> Result<LocalClient> {
                 connection: config_conn,
             })
         }
-        ClientIntention::Transfer => {
-            Err(eyre::eyre!("Transfer intention not supported"))
-        }
+        ClientIntention::Transfer => Err(eyre::eyre!("Transfer intention not supported")),
     }
 }

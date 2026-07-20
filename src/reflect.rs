@@ -7,8 +7,8 @@
 //! synthesizes the bot as a SEPARATE player entity for viewers, fed
 //! from the controller's serverbound movement packets — which all pass
 //! through the proxy, the original project's whole reason for routing
-//! the bot through it. Viewers themselves are switched to spectator
-//! game mode so they free-fly and can't interact.
+//! the bot through it. Viewers keep the bot's HUD-capable game mode but
+//! receive flight and have all interaction packets swallowed locally.
 
 use azalea_core::entity_id::MinecraftEntityId;
 use azalea_core::position::Vec3;
@@ -158,10 +158,7 @@ pub fn gamemode_kit(uuid: Uuid, name: &str, mode: u8) -> Vec<Frame> {
 /// already has the entity, so re-sending it across lobby switches can
 /// never produce a "Duplicate entity UUID" for the reflected bot.
 pub fn reflected_bundle(bot_uuid: Uuid, bot_name: &str, pose: &BotPose) -> Vec<Frame> {
-    let mut v = vec![
-        remove_reflected_frame(),
-        bot_info_frame(bot_uuid, bot_name),
-    ];
+    let mut v = vec![remove_reflected_frame(), bot_info_frame(bot_uuid, bot_name)];
     v.extend(spawn_frames(bot_uuid, pose));
     v
 }
@@ -227,8 +224,8 @@ pub fn accept_teleport_frame(id: u32) -> Frame {
 
 /// Extract the text of a serverbound chat frame, if it is one.
 pub fn chat_text(frame: &Frame) -> Option<String> {
-    use azalea_protocol::packets::ProtocolPacket;
     use azalea_protocol::packets::game::ServerboundGamePacket;
+    use azalea_protocol::packets::ProtocolPacket;
     if frame.packet_id != ids::SB_GAME_CHAT {
         return None;
     }
@@ -243,8 +240,8 @@ pub fn chat_text(frame: &Frame) -> Option<String> {
 /// it would collide with the reflected entity (same uuid) as a
 /// "Duplicate entity UUID" and take the bot avatar down with it.
 pub fn add_entity_uuid(frame: &Frame) -> Option<Uuid> {
-    use azalea_protocol::packets::ProtocolPacket;
     use azalea_protocol::packets::game::ClientboundGamePacket;
+    use azalea_protocol::packets::ProtocolPacket;
     if frame.packet_id != ids::CB_GAME_ADD_ENTITY {
         return None;
     }
@@ -366,12 +363,14 @@ pub fn move_frames(pose: &BotPose) -> Vec<Frame> {
 /// Update the pose from a controller serverbound movement frame.
 /// Returns true when the frame was a movement packet (pose changed).
 pub fn apply_controller_move(pose: &mut BotPose, frame: &Frame) -> bool {
-    use azalea_protocol::packets::ProtocolPacket;
     use azalea_protocol::packets::game::ServerboundGamePacket;
+    use azalea_protocol::packets::ProtocolPacket;
 
     if !matches!(
         frame.packet_id,
-        ids::SB_GAME_MOVE_PLAYER_POS | ids::SB_GAME_MOVE_PLAYER_POS_ROT | ids::SB_GAME_MOVE_PLAYER_ROT
+        ids::SB_GAME_MOVE_PLAYER_POS
+            | ids::SB_GAME_MOVE_PLAYER_POS_ROT
+            | ids::SB_GAME_MOVE_PLAYER_ROT
     ) {
         return false;
     }
@@ -418,22 +417,59 @@ pub fn idle_move_frame(pose: &BotPose) -> Option<Frame> {
 }
 
 /// Update the pose from a clientbound PlayerPosition (server teleport of
-/// the controlled player). Only absolute teleports are applied — the
-/// relative-flag math isn't worth modelling here, and the controller's
-/// next movement packet corrects the pose within a tick anyway.
+/// the controlled player), including per-axis relative changes. This must
+/// also work while controllerless, when no later client movement exists to
+/// correct the stand-in pose.
 pub fn apply_server_teleport(pose: &mut BotPose, frame: &Frame) {
-    use azalea_protocol::packets::ProtocolPacket;
     use azalea_protocol::packets::game::ClientboundGamePacket;
+    use azalea_protocol::packets::ProtocolPacket;
 
     let Ok(ClientboundGamePacket::PlayerPosition(p)) =
         ClientboundGamePacket::read(frame.packet_id, &mut Cursor::new(&frame.body[..]))
     else {
         return;
     };
-    if !p.relative.x && !p.relative.y && !p.relative.z {
-        pose.pos = Some(p.change.pos);
-        pose.look = p.change.look_direction;
+    apply_teleport_change(pose, &p.change, &p.relative);
+}
+
+fn apply_teleport_change(
+    pose: &mut BotPose,
+    change: &azalea_protocol::common::movements::PositionMoveRotation,
+    relative: &azalea_protocol::common::movements::RelativeMovements,
+) {
+    if let Some(base) = pose.pos {
+        pose.pos = Some(Vec3::new(
+            if relative.x {
+                base.x + change.pos.x
+            } else {
+                change.pos.x
+            },
+            if relative.y {
+                base.y + change.pos.y
+            } else {
+                change.pos.y
+            },
+            if relative.z {
+                base.z + change.pos.z
+            } else {
+                change.pos.z
+            },
+        ));
+    } else if !relative.x && !relative.y && !relative.z {
+        pose.pos = Some(change.pos);
     }
+    pose.look = LookDirection::new(
+        if relative.y_rot {
+            pose.look.y_rot() + change.look_direction.y_rot()
+        } else {
+            change.look_direction.y_rot()
+        },
+        if relative.x_rot {
+            pose.look.x_rot() + change.look_direction.x_rot()
+        } else {
+            change.look_direction.x_rot()
+        },
+    );
 }
 
 #[cfg(test)]
@@ -520,9 +556,9 @@ mod tests {
     /// the HUD renders, but never spectator (which hides it): mode 3
     /// falls back to adventure (2).
     fn kit_game_mode(kit: &[Frame]) -> f32 {
-        use azalea_protocol::packets::ProtocolPacket;
-        use azalea_protocol::packets::game::ClientboundGamePacket;
         use azalea_protocol::packets::game::c_game_event::EventType;
+        use azalea_protocol::packets::game::ClientboundGamePacket;
+        use azalea_protocol::packets::ProtocolPacket;
         for f in kit {
             if let Ok(ClientboundGamePacket::GameEvent(g)) =
                 ClientboundGamePacket::read(f.packet_id, &mut Cursor::new(&f.body[..]))
@@ -548,5 +584,32 @@ mod tests {
     fn viewer_kit_avoids_spectator_mode() {
         // a spectator real mode would hide the HUD → adventure fallback
         assert_eq!(kit_game_mode(&viewer_kit(Uuid::nil(), "v", 3)), 2.0);
+    }
+
+    #[test]
+    fn server_teleport_applies_relative_components() {
+        use azalea_protocol::common::movements::{PositionMoveRotation, RelativeMovements};
+
+        let mut pose = BotPose {
+            pos: Some(Vec3::new(10.0, 20.0, 30.0)),
+            look: LookDirection::new(90.0, 10.0),
+            on_ground: false,
+        };
+        let change = PositionMoveRotation {
+            pos: Vec3::new(1.0, 5.0, -2.0),
+            delta: Vec3::default(),
+            look_direction: LookDirection::new(15.0, 25.0),
+        };
+        let relative = RelativeMovements {
+            x: true,
+            z: true,
+            y_rot: true,
+            ..RelativeMovements::default()
+        };
+
+        apply_teleport_change(&mut pose, &change, &relative);
+        assert_eq!(pose.pos, Some(Vec3::new(11.0, 5.0, 28.0)));
+        assert_eq!(pose.look.y_rot(), 105.0);
+        assert_eq!(pose.look.x_rot(), 25.0);
     }
 }

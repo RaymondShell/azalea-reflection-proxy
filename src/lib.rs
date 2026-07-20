@@ -39,11 +39,11 @@ mod upstream;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use eyre::Result;
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
 
 pub use plugin::{Frame, Pipeline, ProxyPlugin, Verdict};
@@ -103,7 +103,7 @@ impl Default for ProxyBuilder {
 }
 
 impl ProxyBuilder {
-    /// Local address the proxy listens on (default `127.0.0.1:25566`;
+    /// Local address the proxy listens on (default `0.0.0.0:25566`;
     /// use port 0 for an OS-assigned free port).
     pub fn bind(mut self, addr: impl Into<String>) -> Self {
         self.bind = addr.into();
@@ -113,12 +113,13 @@ impl ProxyBuilder {
     /// The real server, e.g. `"mc.hypixel.net"` or `"host:port"`.
     pub fn target(mut self, host: impl Into<String>) -> Self {
         let host = host.into();
-        match host.rsplit_once(':') {
-            Some((h, p)) if p.parse::<u16>().is_ok() => {
-                self.target_host = h.to_string();
-                self.target_port = p.parse().unwrap();
-            }
-            _ => self.target_host = host,
+        if let Some((target_host, target_port)) = split_target(&host) {
+            self.target_host = target_host.to_string();
+            self.target_port = target_port;
+        } else {
+            // An unbracketed IPv6 address contains several colons but no
+            // unambiguous port. Keep it intact and use the default port.
+            self.target_host = host.trim_matches(['[', ']']).to_string();
         }
         self
     }
@@ -172,6 +173,9 @@ impl ProxyBuilder {
     pub async fn spawn(self) -> Result<ReflectionProxy> {
         if self.email.is_empty() {
             eyre::bail!("ProxyBuilder::email is required");
+        }
+        if self.max_clients == Some(0) {
+            eyre::bail!("ProxyBuilder::max_clients must be at least 1");
         }
         let listener = local_server::listen(&local_server::LocalServerConfig {
             bind: self.bind.clone(),
@@ -290,7 +294,15 @@ async fn accept_loop(listener: tokio::net::TcpListener, shared: Arc<Shared>) {
 }
 
 async fn handle_connection(stream: tokio::net::TcpStream, shared: Arc<Shared>) -> Result<()> {
-    let mut local = local_server::accept_login(stream).await?;
+    // A peer that connects and never completes the handshake should not
+    // retain a task and socket forever (especially if the caller chose a
+    // non-loopback bind address).
+    let mut local = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        local_server::accept_login(stream),
+    )
+    .await
+    .map_err(|_| eyre::eyre!("local login timed out"))??;
     let username = local.username.clone();
 
     if !shared.whitelist.is_empty()
@@ -338,4 +350,39 @@ async fn handle_connection(stream: tokio::net::TcpStream, shared: Arc<Shared>) -
         shared.events.clone(),
     ));
     Ok(())
+}
+
+/// Split a DNS/IPv4 `host:port` or bracketed IPv6 `[host]:port` target.
+/// Raw IPv6 addresses deliberately return `None` because their final
+/// component is not a port.
+fn split_target(target: &str) -> Option<(&str, u16)> {
+    if let Some(rest) = target.strip_prefix('[') {
+        let (host, port) = rest.split_once("]:")?;
+        return port.parse().ok().map(|port| (host, port));
+    }
+    if target.bytes().filter(|&b| b == b':').count() != 1 {
+        return None;
+    }
+    let (host, port) = target.rsplit_once(':')?;
+    (!host.is_empty()).then_some(())?;
+    port.parse().ok().map(|port| (host, port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_parsing_preserves_ipv6() {
+        assert_eq!(
+            split_target("example.com:25570"),
+            Some(("example.com", 25570))
+        );
+        assert_eq!(
+            split_target("[2001:db8::1]:25570"),
+            Some(("2001:db8::1", 25570))
+        );
+        assert_eq!(split_target("2001:db8::1"), None);
+        assert_eq!(split_target("example.com"), None);
+    }
 }

@@ -21,6 +21,8 @@ pub const SB_CONFIG_FINISH: u32 = 3;
 
 // game, clientbound
 pub const CB_GAME_ADD_ENTITY: u32 = 1;
+pub const CB_GAME_BLOCK_ENTITY_DATA: u32 = 6;
+pub const CB_GAME_BLOCK_UPDATE: u32 = 8;
 pub const CB_GAME_BOSS_EVENT: u32 = 9;
 pub const CB_GAME_CONTAINER_SET_CONTENT: u32 = 18;
 pub const CB_GAME_CONTAINER_SET_SLOT: u32 = 20;
@@ -42,6 +44,7 @@ pub const CB_GAME_REMOVE_MOB_EFFECT: u32 = 78;
 pub const CB_GAME_RESET_SCORE: u32 = 79;
 pub const CB_GAME_RESPAWN: u32 = 82;
 pub const CB_GAME_ROTATE_HEAD: u32 = 83;
+pub const CB_GAME_SECTION_BLOCKS_UPDATE: u32 = 84;
 pub const CB_GAME_SET_CAMERA: u32 = 93;
 pub const CB_GAME_SET_CHUNK_CACHE_CENTER: u32 = 94;
 pub const CB_GAME_SET_CHUNK_CACHE_RADIUS: u32 = 95;
@@ -53,6 +56,7 @@ pub const CB_GAME_SET_EXPERIENCE: u32 = 103;
 pub const CB_GAME_SET_HEALTH: u32 = 104;
 pub const CB_GAME_SET_HELD_SLOT: u32 = 105;
 pub const CB_GAME_SET_OBJECTIVE: u32 = 106;
+pub const CB_GAME_SET_PASSENGERS: u32 = 107;
 pub const CB_GAME_SET_PLAYER_INVENTORY: u32 = 108;
 pub const CB_GAME_SET_PLAYER_TEAM: u32 = 109;
 pub const CB_GAME_SET_SCORE: u32 = 110;
@@ -133,8 +137,7 @@ mod tests {
     fn pinned_ids_match_azalea() {
         use azalea_protocol::packets::config::{
             c_finish_configuration::ClientboundFinishConfiguration,
-            c_keep_alive::ClientboundKeepAlive as ConfigKeepAlive,
-            c_ping::ClientboundPing,
+            c_keep_alive::ClientboundKeepAlive as ConfigKeepAlive, c_ping::ClientboundPing,
             s_finish_configuration::ServerboundFinishConfiguration,
         };
         use azalea_protocol::packets::game::c_start_configuration::ClientboundStartConfiguration;
@@ -151,7 +154,10 @@ mod tests {
             ConfigKeepAlive { id: 0 }.into_variant().id(),
             CB_CONFIG_KEEP_ALIVE
         );
-        assert_eq!(ClientboundPing { id: 0 }.into_variant().id(), CB_CONFIG_PING);
+        assert_eq!(
+            ClientboundPing { id: 0 }.into_variant().id(),
+            CB_CONFIG_PING
+        );
         assert_eq!(
             ClientboundStartConfiguration.into_variant().id(),
             CB_GAME_START_CONFIGURATION
@@ -186,11 +192,15 @@ mod tests {
             CB_GAME_FORGET_LEVEL_CHUNK
         );
         assert_eq!(
-            ClientboundSetChunkCacheCenter { x: 0, z: 0 }.into_variant().id(),
+            ClientboundSetChunkCacheCenter { x: 0, z: 0 }
+                .into_variant()
+                .id(),
             CB_GAME_SET_CHUNK_CACHE_CENTER
         );
         assert_eq!(
-            ClientboundSetChunkCacheRadius { radius: 0 }.into_variant().id(),
+            ClientboundSetChunkCacheRadius { radius: 0 }
+                .into_variant()
+                .id(),
             CB_GAME_SET_CHUNK_CACHE_RADIUS
         );
     }
@@ -214,7 +224,7 @@ mod tests {
         assert_eq!(
             ServerboundMovePlayerPos {
                 pos: Vec3::default(),
-                flags: flags.clone()
+                flags
             }
             .into_variant()
             .id(),
@@ -224,7 +234,7 @@ mod tests {
             ServerboundMovePlayerPosRot {
                 pos: Vec3::default(),
                 look_direction: LookDirection::default(),
-                flags: flags.clone()
+                flags
             }
             .into_variant()
             .id(),
@@ -261,11 +271,14 @@ mod tests {
         use azalea_chat::FormattedText;
         use azalea_core::delta::{LpVec3, PositionDelta8};
         use azalea_core::entity_id::MinecraftEntityId;
-        use azalea_core::position::Vec3;
+        use azalea_core::position::{BlockPos, ChunkSectionPos, Vec3};
         use azalea_entity::LookDirection;
         use azalea_protocol::common::movements::{PositionMoveRotation, RelativeMovements};
         use azalea_protocol::packets::game::{
             c_add_entity::ClientboundAddEntity,
+            c_block_entity_data::ClientboundBlockEntityData,
+            c_block_update::ClientboundBlockUpdate,
+            c_boss_event::{ClientboundBossEvent, Operation},
             c_entity_position_sync::ClientboundEntityPositionSync,
             c_keep_alive::ClientboundKeepAlive,
             c_move_entity_pos::ClientboundMoveEntityPos,
@@ -275,15 +288,16 @@ mod tests {
             c_remove_entities::ClientboundRemoveEntities,
             c_reset_score::ClientboundResetScore,
             c_rotate_head::ClientboundRotateHead,
-            c_boss_event::{ClientboundBossEvent, Operation},
+            c_section_blocks_update::ClientboundSectionBlocksUpdate,
             c_set_health::ClientboundSetHealth,
+            c_set_passengers::ClientboundSetPassengers,
             c_set_player_inventory::ClientboundSetPlayerInventory,
             c_system_chat::ClientboundSystemChat,
             c_teleport_entity::ClientboundTeleportEntity,
             s_accept_teleportation::ServerboundAcceptTeleportation,
             s_keep_alive::ServerboundKeepAlive,
         };
-        use azalea_registry::builtin::EntityKind;
+        use azalea_registry::builtin::{BlockEntityKind, EntityKind};
         use uuid::Uuid;
 
         let eid = MinecraftEntityId(0);
@@ -316,6 +330,25 @@ mod tests {
             CB_GAME_ADD_ENTITY
         );
         assert_eq!(
+            ClientboundBlockEntityData {
+                pos: BlockPos::default(),
+                block_entity_type: BlockEntityKind::Furnace,
+                tag: Default::default(),
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_BLOCK_ENTITY_DATA
+        );
+        assert_eq!(
+            ClientboundBlockUpdate {
+                pos: BlockPos::default(),
+                block_state: Default::default(),
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_BLOCK_UPDATE
+        );
+        assert_eq!(
             ClientboundEntityPositionSync {
                 id: eid,
                 values: pmr.clone(),
@@ -332,7 +365,7 @@ mod tests {
         assert_eq!(
             ClientboundMoveEntityPos {
                 entity_id: eid,
-                delta: delta.clone(),
+                delta,
                 on_ground: false
             }
             .into_variant()
@@ -369,11 +402,9 @@ mod tests {
             CB_GAME_PLAYER_INFO_REMOVE
         );
         assert_eq!(
-            ClientboundRemoveEntities {
-                entity_ids: vec![]
-            }
-            .into_variant()
-            .id(),
+            ClientboundRemoveEntities { entity_ids: vec![] }
+                .into_variant()
+                .id(),
             CB_GAME_REMOVE_ENTITIES
         );
         assert_eq!(
@@ -395,6 +426,15 @@ mod tests {
             CB_GAME_ROTATE_HEAD
         );
         assert_eq!(
+            ClientboundSectionBlocksUpdate {
+                section_pos: ChunkSectionPos::default(),
+                states: vec![],
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_SECTION_BLOCKS_UPDATE
+        );
+        assert_eq!(
             ClientboundSetHealth {
                 health: 0.0,
                 food: 0,
@@ -412,6 +452,15 @@ mod tests {
             .into_variant()
             .id(),
             CB_GAME_SET_PLAYER_INVENTORY
+        );
+        assert_eq!(
+            ClientboundSetPassengers {
+                vehicle: eid,
+                passengers: vec![],
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_SET_PASSENGERS
         );
         assert_eq!(
             ClientboundBossEvent {

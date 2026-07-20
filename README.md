@@ -49,7 +49,8 @@ ClientBuilder::new()
 ```
 
 Spectate by adding a vanilla-client server entry for the same address
-(default `127.0.0.1:25566`; `.bind("127.0.0.1:0")` picks a free port).
+(default `0.0.0.0:25566`; `.bind("127.0.0.1:0")` restricts it to a local,
+OS-assigned free port).
 The client must be on the same protocol version as the azalea git
 revision this crate builds against. A standalone binary (`cargo run`, configured
 via `PROXY_EMAIL` / `PROXY_TARGET` / `PROXY_BIND` / `PROXY_AUTH_CACHE`
@@ -113,8 +114,9 @@ tokio::spawn(async move {
   the world snapshot. Chunk replay is a hard requirement: the vanilla
   client won't leave "Loading terrain..." until the chunk under its
   feet loads.
-- World snapshot (`snapshot.rs`) — the snapshot.js port: entities (with
-  positions accumulated from relative moves), tab list (merged
+- World snapshot (`snapshot.rs`) — the snapshot.js port: changed blocks
+  and block entities since each cached chunk, entities (with positions
+  accumulated from relative moves), passengers, tab list (merged
   player-info entries), scoreboards/teams, player inventory (both the
   container-0 packets and the 1.21.2+ per-slot `set_player_inventory`),
   health/food/xp, time, held slot, weather, and boss bars (accumulated
@@ -191,7 +193,9 @@ is aligned on handoff, but momentum is not carried over.
 
 ## Security note
 
-The local leg is offline-mode by design. Never bind it beyond loopback:
-anyone who can reach the port can drive the authenticated session. If
-you must share it, `.whitelist(...)` and `.max_clients(...)` reduce the
-blast radius — they do not make it safe on the open internet.
+The local leg is offline-mode by design, and the default bind accepts
+remote connections for server-side debugging. Anyone who can reach the
+port can choose any username and potentially drive the authenticated
+session. Restrict the port with a firewall, VPN, or authenticated tunnel;
+do not expose it directly to the open internet. `.whitelist(...)` and
+`.max_clients(...)` reduce accidental access but are not authentication.

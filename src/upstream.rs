@@ -1,26 +1,21 @@
 //! Upstream leg: the proxy's own authenticated connection to the target
 //! server. The proxy — not the bot — owns the real Microsoft session.
 
+use azalea_auth::sessionserver::{self, SessionServerJoinOpts};
+use azalea_auth::{auth, AuthOpts, ProfileResponse};
+use azalea_crypto::encrypt;
 use azalea_protocol::{
     connect::Connection,
     packets::{
-        ClientIntention,
-        PROTOCOL_VERSION,
+        config::{ClientboundConfigPacket, ServerboundConfigPacket},
         handshake::s_intention::ServerboundIntention,
         login::{
-            ClientboundLoginPacket,
-            s_hello::ServerboundHello,
-            s_key::ServerboundKey,
-            s_login_acknowledged::ServerboundLoginAcknowledged,
+            s_hello::ServerboundHello, s_key::ServerboundKey,
+            s_login_acknowledged::ServerboundLoginAcknowledged, ClientboundLoginPacket,
         },
-        config::{
-            ClientboundConfigPacket, ServerboundConfigPacket,
-        },
+        ClientIntention, PROTOCOL_VERSION,
     },
 };
-use azalea_auth::{auth, AuthOpts, ProfileResponse};
-use azalea_auth::sessionserver::{self, SessionServerJoinOpts};
-use azalea_crypto::encrypt;
 use eyre::Result;
 use tokio::net::lookup_host;
 
@@ -55,7 +50,11 @@ fn auth_cache_file() -> Option<std::path::PathBuf> {
 }
 
 pub async fn connect(cfg: &UpstreamConfig) -> Result<Upstream> {
-    tracing::info!("authenticating {} and connecting to {}:{}", cfg.email, cfg.host, cfg.port);
+    tracing::info!(
+        "authenticating account and connecting to {}:{}",
+        cfg.host,
+        cfg.port
+    );
 
     // 1. Auth with Microsoft. Without cache_file azalea-auth keeps NO
     // cache and forces the device-code flow on every launch.
@@ -77,21 +76,42 @@ pub async fn connect(cfg: &UpstreamConfig) -> Result<Upstream> {
     let access_token = auth_result.access_token;
 
     // 2. Resolve and connect
-    let addr = format!("{}:{}", cfg.host, cfg.port);
-    let resolved_addr = lookup_host(&addr).await?
-        .next()
-        .ok_or_else(|| eyre::eyre!("Failed to resolve {}", addr))?;
-
-    let mut conn = Connection::new(&resolved_addr).await
-        .map_err(|e| eyre::eyre!("Connection failed: {:?}", e))?;
+    let mut resolved = lookup_host((cfg.host.as_str(), cfg.port)).await?.peekable();
+    if resolved.peek().is_none() {
+        eyre::bail!("Failed to resolve {}:{}", cfg.host, cfg.port);
+    }
+    // DNS commonly returns both IPv6 and IPv4. Trying only the first one
+    // makes otherwise reachable servers fail on hosts without one family.
+    let mut connection = None;
+    let mut last_error = None;
+    for addr in resolved {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), Connection::new(&addr)).await
+        {
+            Ok(Ok(conn)) => {
+                connection = Some(conn);
+                break;
+            }
+            Ok(Err(error)) => last_error = Some(format!("{error:?}")),
+            Err(_) => last_error = Some(format!("connection to {addr} timed out")),
+        }
+    }
+    let mut conn = connection.ok_or_else(|| {
+        eyre::eyre!(
+            "Connection to {}:{} failed: {}",
+            cfg.host,
+            cfg.port,
+            last_error.unwrap_or_else(|| "no resolved address was reachable".into())
+        )
+    })?;
 
     // 3. Handshake packet
     conn.write(ServerboundIntention {
-        protocol_version: PROTOCOL_VERSION as i32,
+        protocol_version: PROTOCOL_VERSION,
         hostname: cfg.host.clone(),
         port: cfg.port,
         intention: ClientIntention::Login,
-    }).await?;
+    })
+    .await?;
 
     // 4. Switch to login state
     let mut conn = conn.login();
@@ -100,7 +120,8 @@ pub async fn connect(cfg: &UpstreamConfig) -> Result<Upstream> {
     conn.write(ServerboundHello {
         name: profile.name.clone(),
         profile_id: profile.id,
-    }).await?;
+    })
+    .await?;
 
     // 5. Handle encryption
     let packet = conn.read().await?;
@@ -110,8 +131,11 @@ pub async fn connect(cfg: &UpstreamConfig) -> Result<Upstream> {
     };
 
     // Generate secret and encrypt
-    let encrypt_result = encrypt(&encryption_request.public_key, &encryption_request.challenge)
-        .map_err(|e| eyre::eyre!("Encryption failed: {}", e))?;
+    let encrypt_result = encrypt(
+        &encryption_request.public_key,
+        &encryption_request.challenge,
+    )
+    .map_err(|e| eyre::eyre!("Encryption failed: {}", e))?;
 
     // Join session server
     sessionserver::join(SessionServerJoinOpts {
@@ -121,13 +145,16 @@ pub async fn connect(cfg: &UpstreamConfig) -> Result<Upstream> {
         uuid: &profile.id,
         server_id: &encryption_request.server_id,
         proxy: None,
-    }).await.map_err(|e| eyre::eyre!("Session join failed: {:?}", e))?;
+    })
+    .await
+    .map_err(|e| eyre::eyre!("Session join failed: {:?}", e))?;
 
     // Send key response
     conn.write(ServerboundKey {
         key_bytes: encrypt_result.encrypted_public_key,
         encrypted_challenge: encrypt_result.encrypted_challenge,
-    }).await?;
+    })
+    .await?;
 
     // Enable encryption
     conn.set_encryption_key(encrypt_result.secret_key);
