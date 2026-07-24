@@ -140,10 +140,10 @@ pub async fn accept_login(stream: TcpStream) -> Result<LocalClient> {
     }
 }
 
-/// Construct the login-finished packet across Azalea's mc26.1 and mc26.2
-/// layouts. mc26.2 added a trailing chat-session UUID; decoding the common
-/// wire representation lets each selected Azalea version consume the fields
-/// it defines without compile-time field detection.
+/// Encode the mc26.2 wire layout and let the selected Azalea packet type
+/// decode it. The crate-level protocol assertion still rejects mc26.1;
+/// this construction simply keeps that intentional diagnostic from being
+/// obscured by a second struct-layout compiler error during package checks.
 fn login_finished_packet(game_profile: GameProfile) -> Result<ClientboundLoginFinished> {
     let mut encoded = Vec::new();
     game_profile.azalea_write(&mut encoded)?;

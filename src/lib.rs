@@ -28,6 +28,11 @@
 //! # Ok(()) }
 //! ```
 
+const _: () = assert!(
+    azalea_protocol::packets::PROTOCOL_VERSION == 776,
+    "azalea-reflection-proxy requires Minecraft 26.2 (protocol 776)"
+);
+
 mod ids;
 mod local_server;
 pub mod plugin;

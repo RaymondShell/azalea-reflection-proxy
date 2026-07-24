@@ -240,13 +240,18 @@ pub fn chat_text(frame: &Frame) -> Option<String> {
 /// it would collide with the reflected entity (same uuid) as a
 /// "Duplicate entity UUID" and take the bot avatar down with it.
 pub fn add_entity_uuid(frame: &Frame) -> Option<Uuid> {
+    add_entity_info(frame).map(|(_, uuid)| uuid)
+}
+
+/// Entity id and uuid of a clientbound AddEntity frame.
+pub fn add_entity_info(frame: &Frame) -> Option<(i32, Uuid)> {
     use azalea_protocol::packets::game::ClientboundGamePacket;
     use azalea_protocol::packets::ProtocolPacket;
     if frame.packet_id != ids::CB_GAME_ADD_ENTITY {
         return None;
     }
     match ClientboundGamePacket::read(frame.packet_id, &mut Cursor::new(&frame.body[..])) {
-        Ok(ClientboundGamePacket::AddEntity(p)) => Some(p.uuid),
+        Ok(ClientboundGamePacket::AddEntity(p)) => Some((p.id.0, p.uuid)),
         _ => None,
     }
 }
@@ -358,6 +363,110 @@ pub fn move_frames(pose: &BotPose) -> Vec<Frame> {
             y_head_rot: angle_byte(pose.look.y_rot()),
         }),
     ]
+}
+
+/// Mirror a controller arm swing onto the synthesized reflected player.
+pub fn reflected_swing_frame(
+    hand: azalea_protocol::packets::game::s_interact::InteractionHand,
+) -> Frame {
+    use azalea_protocol::packets::game::c_animate::{AnimationAction, ClientboundAnimate};
+    use azalea_protocol::packets::game::s_interact::InteractionHand;
+
+    frame_of(ClientboundAnimate {
+        id: MinecraftEntityId(REFLECTED_ENTITY_ID),
+        action: match hand {
+            InteractionHand::MainHand => AnimationAction::SwingMainHand,
+            InteractionHand::OffHand => AnimationAction::SwingOffHand,
+        },
+    })
+}
+
+/// Shared entity flags for the reflected player (shift/sprint and future
+/// flags). Metadata index 0 is the AbstractEntity bitfield.
+pub fn reflected_entity_flags_frame(flags: u8) -> Frame {
+    reflected_metadata_frame(0, azalea_entity::EntityDataValue::Byte(flags))
+}
+
+/// Active-item flags for the reflected player. Metadata index 8 is the
+/// AbstractLiving bitfield: bit 0 = using item, bit 1 = offhand.
+pub fn reflected_using_item_frame(
+    hand: Option<azalea_protocol::packets::game::s_interact::InteractionHand>,
+) -> Frame {
+    use azalea_protocol::packets::game::s_interact::InteractionHand;
+    let flags = match hand {
+        Some(InteractionHand::MainHand) => 0x01,
+        Some(InteractionHand::OffHand) => 0x03,
+        None => 0,
+    };
+    reflected_metadata_frame(8, azalea_entity::EntityDataValue::Byte(flags))
+}
+
+fn reflected_metadata_frame(index: u8, value: azalea_entity::EntityDataValue) -> Frame {
+    use azalea_entity::{EntityDataItem, EntityMetadataItems};
+    use azalea_protocol::packets::game::c_set_entity_data::ClientboundSetEntityData;
+
+    frame_of(ClientboundSetEntityData {
+        id: MinecraftEntityId(REFLECTED_ENTITY_ID),
+        packed_items: EntityMetadataItems(vec![EntityDataItem { index, value }]),
+    })
+}
+
+/// Retarget visual state that the server sends for the session player
+/// onto the synthesized reflected entity. This keeps authoritative
+/// metadata (including completed item use), velocity, equipment, and
+/// effect particles correct even when the controller input alone is not
+/// enough to infer the final state.
+pub fn retarget_self_visual(frame: &Frame, source_entity_id: i32) -> Option<Frame> {
+    use azalea_protocol::packets::game::ClientboundGamePacket;
+    use azalea_protocol::packets::ProtocolPacket;
+
+    if !matches!(
+        frame.packet_id,
+        ids::CB_GAME_SET_ENTITY_DATA
+            | ids::CB_GAME_SET_ENTITY_MOTION
+            | ids::CB_GAME_SET_EQUIPMENT
+            | ids::CB_GAME_UPDATE_MOB_EFFECT
+            | ids::CB_GAME_REMOVE_MOB_EFFECT
+    ) {
+        return None;
+    }
+
+    let target = MinecraftEntityId(REFLECTED_ENTITY_ID);
+    match ClientboundGamePacket::read(frame.packet_id, &mut Cursor::new(frame.body.as_slice()))
+        .ok()?
+    {
+        ClientboundGamePacket::SetEntityData(mut packet)
+            if packet.id == MinecraftEntityId(source_entity_id) =>
+        {
+            packet.id = target;
+            Some(frame_of(packet))
+        }
+        ClientboundGamePacket::SetEntityMotion(mut packet)
+            if packet.id == MinecraftEntityId(source_entity_id) =>
+        {
+            packet.id = target;
+            Some(frame_of(packet))
+        }
+        ClientboundGamePacket::SetEquipment(mut packet)
+            if packet.entity_id == MinecraftEntityId(source_entity_id) =>
+        {
+            packet.entity_id = target;
+            Some(frame_of(packet))
+        }
+        ClientboundGamePacket::UpdateMobEffect(mut packet)
+            if packet.entity_id == MinecraftEntityId(source_entity_id) =>
+        {
+            packet.entity_id = target;
+            Some(frame_of(packet))
+        }
+        ClientboundGamePacket::RemoveMobEffect(mut packet)
+            if packet.entity_id == MinecraftEntityId(source_entity_id) =>
+        {
+            packet.entity_id = target;
+            Some(frame_of(packet))
+        }
+        _ => None,
+    }
 }
 
 /// Update the pose from a controller serverbound movement frame.
@@ -543,6 +652,41 @@ mod tests {
 
         // a non-AddEntity frame yields None (camera_frame is a SetCamera)
         assert_eq!(add_entity_uuid(&camera_frame(1)), None);
+    }
+
+    #[test]
+    fn self_metadata_is_retargeted_to_the_reflected_entity() {
+        use azalea_entity::{EntityDataItem, EntityDataValue, EntityMetadataItems};
+        use azalea_protocol::packets::game::{
+            c_set_entity_data::ClientboundSetEntityData, ClientboundGamePacket,
+        };
+        use azalea_protocol::packets::ProtocolPacket;
+
+        let source = frame_of(ClientboundSetEntityData {
+            id: MinecraftEntityId(42),
+            packed_items: EntityMetadataItems(vec![EntityDataItem {
+                index: 8,
+                value: EntityDataValue::Byte(1),
+            }]),
+        });
+        let retargeted = retarget_self_visual(&source, 42).expect("matching self packet");
+        let packet = ClientboundGamePacket::read(
+            retargeted.packet_id,
+            &mut Cursor::new(retargeted.body.as_slice()),
+        )
+        .unwrap();
+        let ClientboundGamePacket::SetEntityData(packet) = packet else {
+            panic!("expected SetEntityData");
+        };
+        assert_eq!(packet.id, MinecraftEntityId(REFLECTED_ENTITY_ID));
+        assert_eq!(
+            packet.packed_items.0,
+            vec![EntityDataItem {
+                index: 8,
+                value: EntityDataValue::Byte(1),
+            }]
+        );
+        assert!(retarget_self_visual(&source, 7).is_none());
     }
 
     #[test]

@@ -24,33 +24,50 @@ pub const CB_GAME_ADD_ENTITY: u32 = 1;
 pub const CB_GAME_BLOCK_ENTITY_DATA: u32 = 6;
 pub const CB_GAME_BLOCK_UPDATE: u32 = 8;
 pub const CB_GAME_BOSS_EVENT: u32 = 9;
+pub const CB_GAME_CHANGE_DIFFICULTY: u32 = 10;
+pub const CB_GAME_CHUNKS_BIOMES: u32 = 13;
 pub const CB_GAME_CONTAINER_SET_CONTENT: u32 = 18;
 pub const CB_GAME_CONTAINER_SET_SLOT: u32 = 20;
+pub const CB_GAME_COOLDOWN: u32 = 22;
 pub const CB_GAME_ENTITY_POSITION_SYNC: u32 = 35;
 pub const CB_GAME_FORGET_LEVEL_CHUNK: u32 = 37;
 pub const CB_GAME_GAME_EVENT: u32 = 38;
+pub const CB_GAME_GAME_RULE_VALUES: u32 = 39;
+pub const CB_GAME_INITIALIZE_BORDER: u32 = 43;
 pub const CB_GAME_KEEP_ALIVE: u32 = 44;
 pub const CB_GAME_LEVEL_CHUNK_WITH_LIGHT: u32 = 45;
+pub const CB_GAME_LIGHT_UPDATE: u32 = 48;
 pub const CB_GAME_LOGIN: u32 = 49;
+pub const CB_GAME_MAP_ITEM_DATA: u32 = 51;
 pub const CB_GAME_MOVE_ENTITY_POS: u32 = 53;
 pub const CB_GAME_MOVE_ENTITY_POS_ROT: u32 = 54;
 pub const CB_GAME_MOVE_ENTITY_ROT: u32 = 56;
 pub const CB_GAME_PLAYER_ABILITIES: u32 = 64;
 pub const CB_GAME_PLAYER_INFO_REMOVE: u32 = 69;
 pub const CB_GAME_PLAYER_INFO_UPDATE: u32 = 70;
+pub const CB_GAME_PLAYER_LOOK_AT: u32 = 71;
 pub const CB_GAME_PLAYER_POSITION: u32 = 72;
+pub const CB_GAME_PLAYER_ROTATION: u32 = 73;
 pub const CB_GAME_REMOVE_ENTITIES: u32 = 77;
 pub const CB_GAME_REMOVE_MOB_EFFECT: u32 = 78;
 pub const CB_GAME_RESET_SCORE: u32 = 79;
 pub const CB_GAME_RESPAWN: u32 = 82;
 pub const CB_GAME_ROTATE_HEAD: u32 = 83;
 pub const CB_GAME_SECTION_BLOCKS_UPDATE: u32 = 84;
+pub const CB_GAME_SET_BORDER_CENTER: u32 = 88;
+pub const CB_GAME_SET_BORDER_LERP_SIZE: u32 = 89;
+pub const CB_GAME_SET_BORDER_SIZE: u32 = 90;
+pub const CB_GAME_SET_BORDER_WARNING_DELAY: u32 = 91;
+pub const CB_GAME_SET_BORDER_WARNING_DISTANCE: u32 = 92;
 pub const CB_GAME_SET_CAMERA: u32 = 93;
 pub const CB_GAME_SET_CHUNK_CACHE_CENTER: u32 = 94;
 pub const CB_GAME_SET_CHUNK_CACHE_RADIUS: u32 = 95;
+pub const CB_GAME_SET_CURSOR_ITEM: u32 = 96;
 pub const CB_GAME_SET_DEFAULT_SPAWN_POSITION: u32 = 97;
 pub const CB_GAME_SET_DISPLAY_OBJECTIVE: u32 = 98;
 pub const CB_GAME_SET_ENTITY_DATA: u32 = 99;
+pub const CB_GAME_SET_ENTITY_LINK: u32 = 100;
+pub const CB_GAME_SET_ENTITY_MOTION: u32 = 101;
 pub const CB_GAME_SET_EQUIPMENT: u32 = 102;
 pub const CB_GAME_SET_EXPERIENCE: u32 = 103;
 pub const CB_GAME_SET_HEALTH: u32 = 104;
@@ -60,6 +77,7 @@ pub const CB_GAME_SET_PASSENGERS: u32 = 107;
 pub const CB_GAME_SET_PLAYER_INVENTORY: u32 = 108;
 pub const CB_GAME_SET_PLAYER_TEAM: u32 = 109;
 pub const CB_GAME_SET_SCORE: u32 = 110;
+pub const CB_GAME_SET_SIMULATION_DISTANCE: u32 = 111;
 pub const CB_GAME_SET_TIME: u32 = 113;
 pub const CB_GAME_START_CONFIGURATION: u32 = 118;
 pub const CB_GAME_TAB_LIST: u32 = 122;
@@ -74,6 +92,12 @@ pub const SB_GAME_KEEP_ALIVE: u32 = 28;
 pub const SB_GAME_MOVE_PLAYER_POS: u32 = 30;
 pub const SB_GAME_MOVE_PLAYER_POS_ROT: u32 = 31;
 pub const SB_GAME_MOVE_PLAYER_ROT: u32 = 32;
+pub const SB_GAME_PLAYER_ACTION: u32 = 41;
+pub const SB_GAME_PLAYER_COMMAND: u32 = 42;
+pub const SB_GAME_PLAYER_INPUT: u32 = 43;
+pub const SB_GAME_SET_CARRIED_ITEM: u32 = 53;
+pub const SB_GAME_SWING: u32 = 63;
+pub const SB_GAME_USE_ITEM: u32 = 67;
 
 /// Build a Frame from any typed packet — keeps synthesized frames honest
 /// against the real encoders.
@@ -126,6 +150,17 @@ pub fn forget_chunk_key(body: &[u8]) -> Option<(i32, i32)> {
     let long = u64::from_be_bytes(body.get(0..8)?.try_into().ok()?);
     let pos = ChunkPos::from(long);
     Some((pos.x, pos.z))
+}
+
+pub fn chunk_center(body: &[u8]) -> Option<(i32, i32)> {
+    use azalea_buf::AzBufVar;
+    use std::io::Cursor;
+
+    let mut cursor = Cursor::new(body);
+    Some((
+        i32::azalea_read_var(&mut cursor).ok()?,
+        i32::azalea_read_var(&mut cursor).ok()?,
+    ))
 }
 
 #[cfg(test)]
@@ -207,14 +242,24 @@ mod tests {
 
     #[test]
     fn pinned_movement_ids_match_azalea() {
+        use azalea_core::entity_id::MinecraftEntityId;
         use azalea_core::position::Vec3;
         use azalea_entity::LookDirection;
         use azalea_protocol::common::movements::MoveFlags;
         use azalea_protocol::packets::game::{
             c_player_abilities::{ClientboundPlayerAbilities, PlayerAbilitiesFlags},
+            c_player_look_at::{Anchor, ClientboundPlayerLookAt},
+            c_player_rotation::ClientboundPlayerRotation,
+            s_interact::InteractionHand,
             s_move_player_pos::ServerboundMovePlayerPos,
             s_move_player_pos_rot::ServerboundMovePlayerPosRot,
             s_move_player_rot::ServerboundMovePlayerRot,
+            s_player_action::{Action as PlayerAction, ServerboundPlayerAction},
+            s_player_command::{Action as PlayerCommand, ServerboundPlayerCommand},
+            s_player_input::ServerboundPlayerInput,
+            s_set_carried_item::ServerboundSetCarriedItem,
+            s_swing::ServerboundSwing,
+            s_use_item::ServerboundUseItem,
         };
 
         let flags = MoveFlags {
@@ -263,6 +308,75 @@ mod tests {
             .into_variant()
             .id(),
             CB_GAME_PLAYER_ABILITIES
+        );
+        assert_eq!(
+            ClientboundPlayerLookAt {
+                from_anchor: Anchor::Eyes,
+                pos: Vec3::default(),
+                entity: None,
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_PLAYER_LOOK_AT
+        );
+        assert_eq!(
+            ClientboundPlayerRotation {
+                y_rot: 0.0,
+                relative_y: false,
+                x_rot: 0.0,
+                relative_x: false,
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_PLAYER_ROTATION
+        );
+        assert_eq!(
+            ServerboundPlayerAction {
+                action: PlayerAction::ReleaseUseItem,
+                pos: Default::default(),
+                direction: Default::default(),
+                seq: 0,
+            }
+            .into_variant()
+            .id(),
+            SB_GAME_PLAYER_ACTION
+        );
+        assert_eq!(
+            ServerboundPlayerCommand {
+                id: MinecraftEntityId(0),
+                action: PlayerCommand::StartSprinting,
+                data: 0,
+            }
+            .into_variant()
+            .id(),
+            SB_GAME_PLAYER_COMMAND
+        );
+        assert_eq!(
+            ServerboundPlayerInput::default().into_variant().id(),
+            SB_GAME_PLAYER_INPUT
+        );
+        assert_eq!(
+            ServerboundSetCarriedItem { slot: 0 }.into_variant().id(),
+            SB_GAME_SET_CARRIED_ITEM
+        );
+        assert_eq!(
+            ServerboundSwing {
+                hand: InteractionHand::MainHand,
+            }
+            .into_variant()
+            .id(),
+            SB_GAME_SWING
+        );
+        assert_eq!(
+            ServerboundUseItem {
+                hand: InteractionHand::MainHand,
+                seq: 0,
+                y_rot: 0.0,
+                x_rot: 0.0,
+            }
+            .into_variant()
+            .id(),
+            SB_GAME_USE_ITEM
         );
     }
 
@@ -513,6 +627,172 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pinned_qol_snapshot_ids_match_azalea() {
+        use azalea_core::{delta::LpVec3, difficulty::Difficulty, entity_id::MinecraftEntityId};
+        use azalea_inventory::ItemStack;
+        use azalea_protocol::packets::game::{
+            c_change_difficulty::ClientboundChangeDifficulty,
+            c_chunks_biomes::ClientboundChunksBiomes,
+            c_cooldown::ClientboundCooldown,
+            c_game_rule_values::ClientboundGameRuleValues,
+            c_initialize_border::ClientboundInitializeBorder,
+            c_light_update::ClientboundLightUpdate,
+            c_map_item_data::{ClientboundMapItemData, OptionalMapPatch},
+            c_set_border_center::ClientboundSetBorderCenter,
+            c_set_border_lerp_size::ClientboundSetBorderLerpSize,
+            c_set_border_size::ClientboundSetBorderSize,
+            c_set_border_warning_delay::ClientboundSetBorderWarningDelay,
+            c_set_border_warning_distance::ClientboundSetBorderWarningDistance,
+            c_set_cursor_item::ClientboundSetCursorItem,
+            c_set_entity_link::ClientboundSetEntityLink,
+            c_set_entity_motion::ClientboundSetEntityMotion,
+            c_set_simulation_distance::ClientboundSetSimulationDistance,
+        };
+        use azalea_registry::builtin::ItemKind;
+
+        assert_eq!(
+            ClientboundChangeDifficulty {
+                difficulty: Difficulty::Normal,
+                locked: false,
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_CHANGE_DIFFICULTY
+        );
+        assert_eq!(
+            ClientboundChunksBiomes {
+                chunk_biome_data: vec![],
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_CHUNKS_BIOMES
+        );
+        assert_eq!(
+            ClientboundCooldown {
+                item: ItemKind::Stone,
+                duration: 1,
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_COOLDOWN
+        );
+        assert_eq!(
+            ClientboundGameRuleValues {
+                values: Default::default(),
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_GAME_RULE_VALUES
+        );
+        assert_eq!(
+            ClientboundInitializeBorder {
+                new_center_x: 0.0,
+                new_center_z: 0.0,
+                old_size: 1.0,
+                new_size: 1.0,
+                lerp_time: 0,
+                new_absolute_max_size: 1,
+                warning_blocks: 1,
+                warning_time: 1,
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_INITIALIZE_BORDER
+        );
+        assert_eq!(
+            ClientboundLightUpdate {
+                x: 0,
+                z: 0,
+                light_data: Default::default(),
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_LIGHT_UPDATE
+        );
+        assert_eq!(
+            ClientboundMapItemData {
+                map_id: 0,
+                scale: 0,
+                locked: false,
+                decorations: None,
+                color_patch: OptionalMapPatch(None),
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_MAP_ITEM_DATA
+        );
+        assert_eq!(
+            ClientboundSetBorderCenter {
+                new_center_x: 0.0,
+                new_center_z: 0.0,
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_SET_BORDER_CENTER
+        );
+        assert_eq!(
+            ClientboundSetBorderLerpSize {
+                old_size: 1.0,
+                new_size: 2.0,
+                lerp_time: 1,
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_SET_BORDER_LERP_SIZE
+        );
+        assert_eq!(
+            ClientboundSetBorderSize { size: 1.0 }.into_variant().id(),
+            CB_GAME_SET_BORDER_SIZE
+        );
+        assert_eq!(
+            ClientboundSetBorderWarningDelay { warning_delay: 1 }
+                .into_variant()
+                .id(),
+            CB_GAME_SET_BORDER_WARNING_DELAY
+        );
+        assert_eq!(
+            ClientboundSetBorderWarningDistance { warning_blocks: 1 }
+                .into_variant()
+                .id(),
+            CB_GAME_SET_BORDER_WARNING_DISTANCE
+        );
+        assert_eq!(
+            ClientboundSetCursorItem {
+                contents: ItemStack::Empty,
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_SET_CURSOR_ITEM
+        );
+        assert_eq!(
+            ClientboundSetEntityLink {
+                source_id: MinecraftEntityId(1),
+                dest_id: MinecraftEntityId(2),
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_SET_ENTITY_LINK
+        );
+        assert_eq!(
+            ClientboundSetEntityMotion {
+                id: MinecraftEntityId(1),
+                delta: LpVec3::Zero,
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_SET_ENTITY_MOTION
+        );
+        assert_eq!(
+            ClientboundSetSimulationDistance {
+                simulation_distance: 8,
+            }
+            .into_variant()
+            .id(),
+            CB_GAME_SET_SIMULATION_DISTANCE
+        );
+    }
+
     fn info_packet(
         list_order: bool,
     ) -> azalea_protocol::packets::game::c_player_info_update::ClientboundPlayerInfoUpdate {
@@ -620,5 +900,13 @@ mod tests {
         (12i32).azalea_write(&mut body).unwrap();
         body.extend_from_slice(&[0xAA; 16]); // rest of the packet, irrelevant
         assert_eq!(chunk_key(&body), Some((-7, 12)));
+    }
+
+    #[test]
+    fn chunk_center_roundtrips_through_azalea_encoder() {
+        use azalea_protocol::packets::game::c_set_chunk_cache_center::ClientboundSetChunkCacheCenter;
+
+        let frame = frame_of(ClientboundSetChunkCacheCenter { x: -12, z: 34 });
+        assert_eq!(chunk_center(&frame.body), Some((-12, 34)));
     }
 }

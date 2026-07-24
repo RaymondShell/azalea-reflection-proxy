@@ -19,7 +19,9 @@ exclude = [".github/", ".idea/"]
 # release (mc26.1) does not yet carry. Cargo.lock pins the exact commit.
 # Cargo requires a crates.io version for publishing and strips `git` from
 # the packaged manifest. Build metadata cannot be selected in a dependency
-# requirement, so the publish dry run below is the compatibility gate.
+# requirement, so the compile-time protocol assertion in src/lib.rs rejects
+# the crates.io mc26.1 release instead of silently producing an incompatible
+# package. Publish once the 26.2 Azalea crates are available on crates.io.
 azalea-protocol = { version = "=0.16.0", git = "https://github.com/RaymondShell/azalea" }
 azalea-auth = { version = "=0.16.0", git = "https://github.com/RaymondShell/azalea" }
 azalea-crypto = { version = "=0.16.0", git = "https://github.com/RaymondShell/azalea" }

@@ -85,7 +85,13 @@ struct ClientHandle {
     /// (`SetCamera`); `None` means the camera is on their own player. The
     /// viewer stays in the bot's game mode either way, so the HUD is
     /// always shown — like the original project.
-    camera_target: Option<i32>,
+    camera_target: Option<CameraTarget>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CameraTarget {
+    Bot,
+    Player(Uuid),
 }
 
 /// Join cache: config replay + world state a late viewer needs. Chunks
@@ -102,6 +108,7 @@ struct JoinCache {
     respawn: Option<Frame>,
     spawn_pos: Option<Frame>,
     chunk_center: Option<Frame>,
+    chunk_center_pos: Option<(i32, i32)>,
     chunk_radius: Option<Frame>,
     chunks: HashMap<(i32, i32), Frame>,
     world: crate::snapshot::WorldSnapshot,
@@ -115,13 +122,14 @@ impl JoinCache {
     }
 
     /// The dimension changed: everything tied to the old world is stale.
-    fn on_respawn(&mut self, respawn: Frame) {
+    fn on_respawn(&mut self, respawn: Frame, data_to_keep: u8) {
         self.respawn = Some(respawn);
         self.last_position = None;
         self.spawn_pos = None;
         self.chunk_center = None;
+        self.chunk_center_pos = None;
         self.chunks.clear();
-        self.world.on_respawn();
+        self.world.on_respawn(data_to_keep);
     }
 
     /// The game-state frames to replay at a viewer that just entered the
@@ -136,7 +144,17 @@ impl JoinCache {
         q.push(ids::wait_for_chunks_frame());
         q.extend(self.chunk_radius.iter().cloned());
         q.extend(self.chunk_center.iter().cloned());
-        q.extend(self.chunks.values().cloned());
+        let mut chunks: Vec<_> = self.chunks.iter().collect();
+        if let Some((center_x, center_z)) = self.chunk_center_pos {
+            chunks.sort_unstable_by_key(|(&(x, z), _)| {
+                let dx = i128::from(x) - i128::from(center_x);
+                let dz = i128::from(z) - i128::from(center_z);
+                (dx * dx + dz * dz, x, z)
+            });
+        } else {
+            chunks.sort_unstable_by_key(|(&(x, z), _)| (x, z));
+        }
+        q.extend(chunks.into_iter().map(|(_, frame)| frame.clone()));
         q.extend(self.world.replay());
         q
     }
@@ -182,6 +200,11 @@ struct Session {
     /// The session player's entity id from the Login packet — a
     /// viewer's own client entity, used to detach `,spectate` cameras.
     real_player_id: Option<i32>,
+    /// Metadata flags synthesized for the reflected bot from controller
+    /// inputs. Index 0 carries shift/sprint; index 8 carries active-item
+    /// state.
+    reflected_entity_flags: u8,
+    reflected_using_hand: Option<azalea_protocol::packets::game::s_interact::InteractionHand>,
     opts: SessionOpts,
     events: broadcast::Sender<ProxyEvent>,
 }
@@ -259,6 +282,8 @@ pub fn spawn(
         controller_moved_recently: false,
         forward_next_position: false,
         real_player_id: None,
+        reflected_entity_flags: 0,
+        reflected_using_hand: None,
         opts,
         events,
     };
@@ -313,6 +338,17 @@ fn login_info(f: &Frame) -> (Option<u8>, Option<i32>) {
             (Some(l.common.game_type.to_id()), Some(l.player_id.0))
         }
         _ => (None, None),
+    }
+}
+
+fn respawn_data_to_keep(f: &Frame) -> u8 {
+    use azalea_protocol::packets::game::ClientboundGamePacket;
+    use azalea_protocol::packets::ProtocolPacket;
+    use std::io::Cursor;
+
+    match ClientboundGamePacket::read(f.packet_id, &mut Cursor::new(&f.body)) {
+        Ok(ClientboundGamePacket::Respawn(respawn)) => respawn.data_to_keep,
+        _ => 0,
     }
 }
 
@@ -434,6 +470,17 @@ impl Session {
     async fn on_upstream_frame(&mut self, frame: Frame) {
         for f in self.pipeline.clientbound(frame) {
             let id = f.packet_id;
+            let added_entity = reflect::add_entity_info(&f);
+            let reflected_self_visual = self
+                .real_player_id
+                .and_then(|player_id| reflect::retarget_self_visual(&f, player_id));
+            let refresh_reflected_equipment = matches!(
+                id,
+                ids::CB_GAME_CONTAINER_SET_CONTENT
+                    | ids::CB_GAME_CONTAINER_SET_SLOT
+                    | ids::CB_GAME_SET_PLAYER_INVENTORY
+                    | ids::CB_GAME_SET_HELD_SLOT
+            );
             self.observe_clientbound(&f);
             self.stand_in(&f).await;
             self.broadcast(f);
@@ -443,6 +490,22 @@ impl Session {
                 && (id == ids::CB_GAME_LOGIN || id == ids::CB_GAME_RESPAWN)
             {
                 self.reassert_spectators();
+            }
+            if id == ids::CB_GAME_PLAYER_POSITION {
+                self.spawn_reflected_if_pending();
+            }
+            if let Some((entity_id, uuid)) = added_entity {
+                self.restore_player_cameras(uuid, entity_id);
+            }
+            if let Some(visual) = reflected_self_visual {
+                self.send_to_viewers(&[visual]);
+            }
+            if refresh_reflected_equipment && self.pose.pos.is_some() {
+                let equipment = self
+                    .cache
+                    .world
+                    .reflected_equipment_frame(reflect::REFLECTED_ENTITY_ID);
+                self.send_to_viewers(&[equipment]);
             }
         }
     }
@@ -553,6 +616,9 @@ impl Session {
                         let (mode, pid) = login_info(f);
                         self.real_game_mode = mode.unwrap_or(0);
                         self.real_player_id = pid;
+                        if let Some(pid) = pid {
+                            self.cache.world.set_player_entity_id(pid);
+                        }
                         // reconfiguration path: Live viewers' entities were
                         // wiped and they need the upcoming position
                         self.respawn_entity_pending = true;
@@ -564,7 +630,7 @@ impl Session {
                         reflect::apply_server_teleport(&mut self.pose, f);
                     }
                     ids::CB_GAME_RESPAWN => {
-                        self.cache.on_respawn(f.clone());
+                        self.cache.on_respawn(f.clone(), respawn_data_to_keep(f));
                         // dimension change wipes entities and positions
                         self.pose.pos = None;
                         self.respawn_entity_pending = true;
@@ -587,6 +653,7 @@ impl Session {
                         self.cache.spawn_pos = Some(f.clone());
                     }
                     ids::CB_GAME_SET_CHUNK_CACHE_CENTER => {
+                        self.cache.chunk_center_pos = ids::chunk_center(&f.body);
                         self.cache.chunk_center = Some(f.clone());
                     }
                     ids::CB_GAME_SET_CHUNK_CACHE_RADIUS => {
@@ -618,6 +685,111 @@ impl Session {
     /// Controller frames go upstream (through the pipeline); viewer
     /// frames are swallowed except join acks. `,commands` work from
     /// anyone and never reach the server.
+    fn mirror_controller_state(&mut self, frame: &Frame) -> (bool, Vec<Frame>) {
+        use azalea_protocol::packets::game::s_player_action::Action as PlayerAction;
+        use azalea_protocol::packets::game::s_player_command::Action as PlayerCommand;
+        use azalea_protocol::packets::game::ServerboundGamePacket;
+        use azalea_protocol::packets::ProtocolPacket;
+        use std::io::Cursor;
+
+        let parsed = || {
+            ServerboundGamePacket::read(frame.packet_id, &mut Cursor::new(frame.body.as_slice()))
+                .ok()
+        };
+
+        match frame.packet_id {
+            ids::SB_GAME_SET_CARRIED_ITEM => {
+                let Some(ServerboundGamePacket::SetCarriedItem(packet)) = parsed() else {
+                    return (true, Vec::new());
+                };
+                if packet.slot > 8 {
+                    return (false, Vec::new());
+                }
+                let mut frames = Vec::new();
+                if let Some(held) = self
+                    .cache
+                    .world
+                    .set_selected_hotbar_slot(u32::from(packet.slot))
+                {
+                    frames.push(held);
+                }
+                if self.reflected_using_hand.take().is_some() {
+                    frames.push(reflect::reflected_using_item_frame(None));
+                }
+                if self.pose.pos.is_some() {
+                    frames.push(
+                        self.cache
+                            .world
+                            .reflected_equipment_frame(reflect::REFLECTED_ENTITY_ID),
+                    );
+                }
+                (true, frames)
+            }
+            ids::SB_GAME_SWING => {
+                let Some(ServerboundGamePacket::Swing(packet)) = parsed() else {
+                    return (true, Vec::new());
+                };
+                (true, vec![reflect::reflected_swing_frame(packet.hand)])
+            }
+            ids::SB_GAME_PLAYER_INPUT => {
+                let Some(ServerboundGamePacket::PlayerInput(packet)) = parsed() else {
+                    return (true, Vec::new());
+                };
+                let mut flags = self.reflected_entity_flags & !(0x02 | 0x08);
+                if packet.shift {
+                    flags |= 0x02;
+                }
+                if packet.sprint {
+                    flags |= 0x08;
+                }
+                if flags == self.reflected_entity_flags {
+                    (true, Vec::new())
+                } else {
+                    self.reflected_entity_flags = flags;
+                    (true, vec![reflect::reflected_entity_flags_frame(flags)])
+                }
+            }
+            ids::SB_GAME_PLAYER_COMMAND => {
+                let Some(ServerboundGamePacket::PlayerCommand(packet)) = parsed() else {
+                    return (true, Vec::new());
+                };
+                let new_flags = match packet.action {
+                    PlayerCommand::StartSprinting => self.reflected_entity_flags | 0x08,
+                    PlayerCommand::StopSprinting => self.reflected_entity_flags & !0x08,
+                    _ => return (true, Vec::new()),
+                };
+                if new_flags == self.reflected_entity_flags {
+                    (true, Vec::new())
+                } else {
+                    self.reflected_entity_flags = new_flags;
+                    (true, vec![reflect::reflected_entity_flags_frame(new_flags)])
+                }
+            }
+            ids::SB_GAME_USE_ITEM => {
+                let Some(ServerboundGamePacket::UseItem(packet)) = parsed() else {
+                    return (true, Vec::new());
+                };
+                self.reflected_using_hand = Some(packet.hand);
+                (
+                    true,
+                    vec![reflect::reflected_using_item_frame(Some(packet.hand))],
+                )
+            }
+            ids::SB_GAME_PLAYER_ACTION => {
+                let Some(ServerboundGamePacket::PlayerAction(packet)) = parsed() else {
+                    return (true, Vec::new());
+                };
+                if packet.action == PlayerAction::ReleaseUseItem {
+                    self.reflected_using_hand = None;
+                    (true, vec![reflect::reflected_using_item_frame(None)])
+                } else {
+                    (true, Vec::new())
+                }
+            }
+            _ => (true, Vec::new()),
+        }
+    }
+
     async fn on_client_frame(&mut self, id: ClientId, frame: Frame) -> Result<()> {
         // chat commands, from controller and viewers alike
         if matches!(self.upstream_state, UpstreamState::Game) {
@@ -630,6 +802,11 @@ impl Session {
         }
 
         if Some(id) == self.controller {
+            let (forward, reflected_updates) = self.mirror_controller_state(&frame);
+            if !forward {
+                self.feedback(id, "invalid hotbar slot was blocked");
+                return Ok(());
+            }
             // Swallow the bot's keepalive reply: the proxy already answered
             // it in stand_in(), and a duplicate keepalive would look wrong
             // to the server. (Proxy-owned keepalives are what keep the
@@ -690,19 +867,28 @@ impl Session {
             // Then mirror to spectators: ordinary ones see the reflected
             // entity move; ride-along ones get glued to the bot.
             if moved {
-                let update = if self.respawn_entity_pending && self.pose.pos.is_some() {
-                    self.respawn_entity_pending = false;
-                    // Idempotent re-spawn: clear any previous copy, re-add
-                    // the bot's profile (a Login/Respawn lobby switch clears
-                    // the tab list), then spawn — otherwise the client logs
-                    // "add player prior to player info" or "Duplicate entity
-                    // UUID" for the reflected bot.
-                    reflect::reflected_bundle(self.bot_uuid, &self.bot_name, &self.pose)
+                if self.respawn_entity_pending && self.pose.pos.is_some() {
+                    self.spawn_reflected_if_pending();
                 } else {
-                    reflect::move_frames(&self.pose)
-                };
-                self.send_to_viewers(&update);
+                    self.send_to_viewers(&reflect::move_frames(&self.pose));
+                }
             }
+            if !reflected_updates.is_empty() {
+                self.send_to_viewers(&reflected_updates);
+            }
+            return Ok(());
+        }
+
+        // A viewer can scroll its local hotbar even though its gameplay
+        // packets are swallowed. Immediately restore the controller's
+        // authoritative slot so the HUD cannot drift.
+        if frame.packet_id == ids::SB_GAME_SET_CARRIED_ITEM {
+            let held = self.cache.world.selected_hotbar_frame();
+            self.queue_frames(
+                id,
+                [held],
+                "queue overflow while restoring hotbar selection",
+            );
             return Ok(());
         }
 
@@ -722,11 +908,8 @@ impl Session {
                 (c.uuid, c.username.clone())
             };
             queue.extend(reflect::viewer_kit(uuid, &name, self.real_game_mode));
-            queue.extend(reflect::reflected_bundle(
-                self.bot_uuid,
-                &self.bot_name,
-                &self.pose,
-            ));
+            queue.extend(self.cache.world.self_hud_frames());
+            queue.extend(self.reflected_bundle());
             let c = self.clients.get_mut(&id).expect("checked above");
             let mut ok = true;
             for f in queue {
@@ -808,12 +991,39 @@ impl Session {
             }
             ",spectate" => self.cmd_spectate(id, arg),
             ",gamemode" | ",gm" => self.cmd_gamemode(id, arg),
+            ",status" => self.cmd_status(id),
             _ => self.feedback(
                 id,
-                "commands: ,acquire ,release ,spectate [player] ,gamemode <0-3|name>",
+                "commands: ,acquire ,release ,spectate [player|off|status] ,gamemode <0-3|name> ,status",
             ),
         }
         Ok(())
+    }
+
+    fn cmd_status(&mut self, id: ClientId) {
+        let controller = self
+            .controller
+            .and_then(|controller| self.clients.get(&controller))
+            .map(|client| client.username.as_str())
+            .unwrap_or("none");
+        let camera = self
+            .clients
+            .get(&id)
+            .and_then(|client| client.camera_target)
+            .map(|target| self.camera_target_name(target))
+            .unwrap_or_else(|| "free".to_string());
+        self.feedback(
+            id,
+            &format!(
+                "protocol {} ({}), clients {}, controller {}, camera {}, hotbar slot {}",
+                azalea_protocol::packets::VERSION_NAME,
+                azalea_protocol::packets::PROTOCOL_VERSION,
+                self.clients.len(),
+                controller,
+                camera,
+                self.cache.world.selected_hotbar_slot() + 1,
+            ),
+        );
     }
 
     /// `,spectate [username]` — the original project's model: a plain
@@ -832,28 +1042,44 @@ impl Session {
             Some(c) => c.camera_target,
             None => return,
         };
-        // resolve the requested target entity
-        let target = if arg.is_empty() || arg.eq_ignore_ascii_case(&self.bot_name) {
-            reflect::REFLECTED_ENTITY_ID
+
+        if arg.eq_ignore_ascii_case("status") {
+            let message = match current {
+                Some(target) => format!("camera locked to {}", self.camera_target_name(target)),
+                None => "camera is free".to_string(),
+            };
+            self.feedback(id, &message);
+            return;
+        }
+
+        let release_requested =
+            arg.eq_ignore_ascii_case("off") || arg.eq_ignore_ascii_case("release");
+        let (requested, target_entity) = if release_requested {
+            (None, None)
+        } else if arg.is_empty() || arg.eq_ignore_ascii_case(&self.bot_name) {
+            (Some(CameraTarget::Bot), Some(reflect::REFLECTED_ENTITY_ID))
         } else {
-            match self.cache.world.entity_id_for_player(arg) {
-                Some(eid) => eid,
+            match self.cache.world.player_target(arg) {
+                Some((uuid, entity_id)) => (Some(CameraTarget::Player(uuid)), Some(entity_id)),
                 None => {
                     self.feedback(id, "player not found (not in render distance?)");
                     return;
                 }
             }
         };
-        // toggle: locking the target you already watch releases the camera
-        let new_target = if current == Some(target) {
+
+        // Locking the target already being watched toggles back to self.
+        let new_target = if requested.is_some() && current == requested {
             None
         } else {
-            Some(target)
+            requested
         };
-        // camera goes to the target, or back to the viewer's own player
-        // id when releasing (the viewer's client uses the bot's Login
-        // player id as its own entity id)
-        let camera_id = new_target.unwrap_or_else(|| self.real_player_id.unwrap_or(target));
+        let fallback = self.real_player_id.unwrap_or(reflect::REFLECTED_ENTITY_ID);
+        let camera_id = if new_target.is_some() {
+            target_entity.unwrap_or(fallback)
+        } else {
+            fallback
+        };
         if self.queue_frames(
             id,
             [reflect::camera_frame(camera_id)],
@@ -863,14 +1089,27 @@ impl Session {
                 c.camera_target = new_target;
             }
         }
-        self.feedback(
-            id,
-            if new_target.is_some() {
-                "camera locked — ,spectate again to release"
-            } else {
-                "camera released"
-            },
-        );
+        let feedback = if let Some(target) = new_target {
+            format!(
+                "camera locked to {} — use ,spectate off to release",
+                self.camera_target_name(target)
+            )
+        } else {
+            "camera released".to_string()
+        };
+        self.feedback(id, &feedback);
+    }
+
+    fn camera_target_name(&self, target: CameraTarget) -> String {
+        match target {
+            CameraTarget::Bot => self.bot_name.clone(),
+            CameraTarget::Player(uuid) => self
+                .cache
+                .world
+                .player_name(uuid)
+                .map(str::to_owned)
+                .unwrap_or_else(|| uuid.to_string()),
+        }
     }
 
     /// `,gamemode <0-3|name>` — client-side game mode for the issuing
@@ -906,6 +1145,79 @@ impl Session {
         }
     }
 
+    fn reflected_bundle(&self) -> Vec<Frame> {
+        let mut frames = reflect::reflected_bundle(self.bot_uuid, &self.bot_name, &self.pose);
+        if self.pose.pos.is_some() {
+            frames.extend(
+                self.cache
+                    .world
+                    .reflected_self_state_frames(reflect::REFLECTED_ENTITY_ID),
+            );
+            frames.push(reflect::reflected_entity_flags_frame(
+                self.reflected_entity_flags,
+            ));
+            frames.push(reflect::reflected_using_item_frame(
+                self.reflected_using_hand,
+            ));
+            frames.push(
+                self.cache
+                    .world
+                    .reflected_equipment_frame(reflect::REFLECTED_ENTITY_ID),
+            );
+        }
+        frames
+    }
+
+    fn spawn_reflected_if_pending(&mut self) {
+        if !self.respawn_entity_pending || self.pose.pos.is_none() {
+            return;
+        }
+        self.respawn_entity_pending = false;
+        let frames = self.reflected_bundle();
+        self.send_to_viewers(&frames);
+        self.restore_bot_cameras();
+    }
+
+    fn restore_bot_cameras(&mut self) {
+        let viewers: Vec<_> = self
+            .clients
+            .iter()
+            .filter(|(&id, client)| {
+                Some(id) != self.controller
+                    && matches!(client.state, ClientState::Live)
+                    && client.camera_target == Some(CameraTarget::Bot)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in viewers {
+            self.queue_frames(
+                id,
+                [reflect::camera_frame(reflect::REFLECTED_ENTITY_ID)],
+                "queue overflow while restoring bot camera",
+            );
+        }
+    }
+
+    fn restore_player_cameras(&mut self, uuid: Uuid, entity_id: i32) {
+        let viewers: Vec<_> = self
+            .clients
+            .iter()
+            .filter(|(&id, client)| {
+                Some(id) != self.controller
+                    && matches!(client.state, ClientState::Live)
+                    && client.camera_target == Some(CameraTarget::Player(uuid))
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in viewers {
+            self.queue_frames(
+                id,
+                [reflect::camera_frame(entity_id)],
+                "queue overflow while restoring player camera",
+            );
+        }
+    }
+
     /// Turn a controller back into a viewer: the viewer kit (bot game
     /// mode + flight, HUD on), the bot's inventory/vitals so the HUD is
     /// correct, and the reflected bot entity so they can see/spectate it.
@@ -915,11 +1227,7 @@ impl Session {
         };
         let mut frames = reflect::viewer_kit(c.uuid, &c.username, self.real_game_mode);
         frames.extend(self.cache.world.self_hud_frames());
-        frames.extend(reflect::reflected_bundle(
-            self.bot_uuid,
-            &self.bot_name,
-            &self.pose,
-        ));
+        frames.extend(self.reflected_bundle());
         if self.queue_frames(id, frames, "queue overflow while becoming a viewer") {
             if let Some(c) = self.clients.get_mut(&id) {
                 c.camera_target = None;
@@ -937,6 +1245,9 @@ impl Session {
         let uuid = c.uuid;
         let username = c.username.clone();
         let mut frames = reflect::controller_kit(uuid, &username, self.real_game_mode);
+        if let Some(player_id) = self.real_player_id {
+            frames.push(reflect::camera_frame(player_id));
+        }
         frames.extend(self.abilities.iter().cloned());
         let teleport = reflect::handoff_teleport_frame(&self.pose);
         let has_teleport = teleport.is_some();
@@ -957,8 +1268,8 @@ impl Session {
 
     /// Re-send the viewer kit to every Live viewer after a Login /
     /// Respawn (which resets the client's game mode, flight, and camera).
-    /// The camera also resets to self, so clear any `,spectate` lock —
-    /// the viewer re-issues `,spectate` once the new world has loaded.
+    /// Logical camera targets are retained and reattached once their
+    /// entity is present in the new world.
     fn reassert_spectators(&mut self) {
         let viewers: Vec<(ClientId, Uuid, String)> = self
             .clients
@@ -971,11 +1282,7 @@ impl Session {
         for (cid, uuid, name) in viewers {
             let mut frames = reflect::viewer_kit(uuid, &name, self.real_game_mode);
             frames.extend(self.cache.world.self_hud_frames());
-            if self.queue_frames(cid, frames, "queue overflow while resetting viewer") {
-                if let Some(c) = self.clients.get_mut(&cid) {
-                    c.camera_target = None;
-                }
-            }
+            self.queue_frames(cid, frames, "queue overflow while resetting viewer");
         }
     }
 
@@ -1074,7 +1381,9 @@ impl Session {
                     false
                 }
             }
-            ids::CB_GAME_PLAYER_ABILITIES => false,
+            ids::CB_GAME_PLAYER_ABILITIES
+            | ids::CB_GAME_PLAYER_LOOK_AT
+            | ids::CB_GAME_PLAYER_ROTATION => false,
             // GameEvent body starts with the event byte; 3 = ChangeGameMode
             ids::CB_GAME_GAME_EVENT => f.body.first() != Some(&3),
             _ => true,
@@ -1205,5 +1514,39 @@ impl Session {
         } else {
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk_frame(x: i32, z: i32) -> Frame {
+        let mut body = Vec::new();
+        body.extend_from_slice(&x.to_be_bytes());
+        body.extend_from_slice(&z.to_be_bytes());
+        Frame {
+            packet_id: ids::CB_GAME_LEVEL_CHUNK_WITH_LIGHT,
+            body,
+        }
+    }
+
+    #[test]
+    fn join_replays_center_chunks_first() {
+        let mut cache = JoinCache {
+            chunk_center_pos: Some((0, 0)),
+            ..JoinCache::default()
+        };
+        for (x, z) in [(8, 8), (1, 0), (0, 0), (-2, 0)] {
+            cache.chunks.insert((x, z), chunk_frame(x, z));
+        }
+
+        let chunks: Vec<_> = cache
+            .join_frames()
+            .into_iter()
+            .filter(|frame| frame.packet_id == ids::CB_GAME_LEVEL_CHUNK_WITH_LIGHT)
+            .filter_map(|frame| ids::chunk_key(&frame.body))
+            .collect();
+        assert_eq!(chunks, [(0, 0), (1, 0), (-2, 0), (8, 8)]);
     }
 }

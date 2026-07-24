@@ -51,10 +51,12 @@ ClientBuilder::new()
 Spectate by adding a vanilla-client server entry for the same address
 (default `0.0.0.0:25566`; `.bind("127.0.0.1:0")` restricts it to a local,
 OS-assigned free port).
-The client must be on the same protocol version as the azalea git
-revision this crate builds against. A standalone binary (`cargo run`, configured
-via `PROXY_EMAIL` / `PROXY_TARGET` / `PROXY_BIND` / `PROXY_AUTH_CACHE`
-env vars) wraps the same builder.
+The client must be Minecraft 26.2 (protocol 776), matching the pinned
+Azalea git revision. A compile-time assertion deliberately rejects older
+Azalea protocol revisions, including the current crates.io mc26.1 build.
+A standalone binary (`cargo run`, configured via `PROXY_EMAIL` /
+`PROXY_TARGET` / `PROXY_BIND` / `PROXY_AUTH_CACHE` env vars) wraps the
+same builder.
 
 ### Commands (type in chat from any connected client)
 
@@ -64,16 +66,21 @@ env vars) wraps the same builder.
   teleport confirms itself so the session stays alive with nobody
   driving (unless `always_first_control` is on, in which case the
   oldest viewer inherits control)
-- `,spectate [username]` — lock your camera to an entity (a plain
+- `,spectate [username|off|status]` — lock your camera to an entity (a plain
   `SetCamera`, like the original). No arg (or the bot's name) locks to
   the reflected bot, so you see what the bot sees; another player's
-  name locks to them. Run it again on the same target to release the
-  camera back to your own player. You stay in the bot's game mode the
-  whole time (never spectator), so the **full HUD** — inventory, held
-  item, health/hunger, xp — stays visible whether or not the camera is
-  locked. Viewers only.
+  name locks to them. Run it again on the same target, or use `off`, to
+  release the camera back to your own player; `status` reports the
+  current target. Camera targets survive respawns and are restored as
+  soon as their entity exists in the new dimension. You stay in the
+  bot's game mode the whole time (never spectator), so the **full HUD**
+  — inventory, selected hotbar slot, held item, health/hunger, effects,
+  and xp — stays visible whether or not the camera is locked. Viewers
+  only.
 - `,gamemode <survival|creative|adventure|spectator|0-3>` —
   client-side game mode for the issuing viewer
+- `,status` — show the active protocol, connected-client count,
+  controller, camera target, and authoritative hotbar slot
 
 ### Builder options beyond the basics
 
@@ -111,32 +118,40 @@ tokio::spawn(async move {
   mid-session get cached config frames + a synthesized
   FinishConfiguration, then Login, Respawn (if the session changed
   dimension), position, Game Event 13, the full raw chunk cache, and
-  the world snapshot. Chunk replay is a hard requirement: the vanilla
-  client won't leave "Loading terrain..." until the chunk under its
-  feet loads.
+  the world snapshot. Chunks are replayed nearest the current center
+  first so terrain around the player becomes useful sooner. Chunk
+  replay is a hard requirement: the vanilla client won't leave
+  "Loading terrain..." until the chunk under its feet loads.
 - World snapshot (`snapshot.rs`) — the snapshot.js port: changed blocks
-  and block entities since each cached chunk, entities (with positions
-  accumulated from relative moves), passengers, tab list (merged
-  player-info entries), scoreboards/teams, player inventory (both the
-  container-0 packets and the 1.21.2+ per-slot `set_player_inventory`),
-  health/food/xp, time, held slot, weather, and boss bars (accumulated
-  per uuid and replayed as a synthesized `Add`, so a viewer joining
-  mid-fight doesn't crash on the next boss-bar update). Cached as raw
-  frames and replayed to mid-session joiners.
+  and block entities since each cached chunk, biome and light updates,
+  entities (with positions accumulated from movement and latest velocity),
+  links, passengers, tab list (merged player-info entries),
+  dependency-ordered scoreboards/teams, player inventory (both the
+  container-0 packets and the 1.21.2+ per-slot
+  `set_player_inventory`), cursor item, selected hotbar slot,
+  health/food/xp, player metadata/attributes/effects, maps, cooldowns,
+  time, weather, world border, difficulty, game rules, simulation
+  distance, and boss bars (accumulated per uuid and replayed as a
+  synthesized `Add`, so a viewer joining mid-fight doesn't crash on
+  the next boss-bar update). Cached as raw frames or normalized state
+  and replayed to mid-session joiners.
 - Viewers (`reflect.rs`) — like the original, viewers stay in the
   bot's game mode with flight (own-uuid player info + game event +
   abilities — modern clients key game mode off the player-info entry,
   so the event alone is not enough), re-asserted after every
   Login/Respawn. That keeps the HUD on and lets them free-fly. They see
   the bot as a synthesized reflected player entity, mirrored live from
-  the controller's serverbound movement packets, and `,spectate` is a
-  plain `SetCamera` toggle onto it (or another player). The session's
-  own teleports, abilities, and game-mode changes are filtered away
-  from viewers so their view survives; one position frame is let
-  through after dimension changes so they land in the new world.
+  the controller's serverbound movement, swing, sprint, sneak, item-use,
+  hotbar, inventory, armor, and offhand packets. `,spectate` is a plain
+  `SetCamera` toggle onto it (or another player), with the logical target
+  restored after dimension changes. The session's own teleports,
+  rotations, abilities, and game-mode changes are filtered away from
+  viewers so their view survives; one position frame is let through
+  after dimension changes so they land in the new world.
 - Login legs (`upstream.rs`, `local_server.rs`) — full Microsoft auth +
   encryption + compression dance upstream; offline-mode mirror locally
-  (uncompressed, loopback only).
+  (uncompressed and bind-configurable for local or port-forwarded server
+  debugging).
 - Plugin pipeline (`plugin.rs`) — Forward / Drop / Replace verdicts on
   raw frames, in registration order, mirroring the original's plugin
   semantics (`onReadReal` ≈ `on_clientbound`, `onWriteReal` ≈
@@ -163,12 +178,13 @@ parses that one packet.
 Everything above is implemented. The passthrough and replicator paths
 (bot through proxy, viewer join, terrain) and the viewer HUD have been
 tested live — hardening the mid-session join (modern inventory sync,
-boss-bar replay) came directly out of that testing. The `,spectate`
-`SetCamera` toggle is newly reworked to match the original and is
-unverified on the live client. Control handoff, the event stream, and
-whitelist/max_clients have unit-test coverage but little live mileage
-yet. Treat `,acquire` with care on anticheat-guarded servers: position
-is aligned on handoff, but momentum is not carried over.
+boss-bar replay) came directly out of that testing. The richer
+scoreboard/map/world replay, persistent `,spectate` targets, and
+reflected equipment/actions have automated coverage but still need
+broader live-client mileage. Control handoff, the event stream, and
+whitelist/max_clients also have unit-test coverage but little live
+mileage yet. Treat `,acquire` with care on anticheat-guarded servers:
+position is aligned on handoff, but momentum is not carried over.
 
 ## What is NOT ported (and why)
 
@@ -177,8 +193,9 @@ is aligned on handoff, but momentum is not carried over.
   original's `createBotReflected` integration mode forces
   (`noLimbo: true`); a limbo lobby only matters for its standalone
   public-server mode.
-- `version` option — the protocol version is pinned by the azalea
-  git revision this crate builds against.
+- `version` option — this release intentionally supports only Minecraft
+  26.2 (protocol 776), pinned by the Azalea git revision and enforced at
+  compile time.
 - Physics simulation while uncontrolled — the original hosts a
   mineflayer bot in-process and re-enables its physics; here the bot
   is your own azalea process, so the proxy stands in (keepalives +
