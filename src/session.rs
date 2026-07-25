@@ -20,7 +20,7 @@ use std::sync::Arc;
 use azalea_protocol::connect::Connection;
 use azalea_protocol::packets::config::{ClientboundConfigPacket, ServerboundConfigPacket};
 use eyre::Result;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use uuid::Uuid;
 
@@ -46,20 +46,33 @@ use crate::upstream::Upstream;
 
 pub type ClientId = u32;
 
-pub enum SessionMsg {
+const MAX_REPLAY_PENDING_FRAMES: usize = 32_768;
+
+pub(crate) enum SessionMsg {
     FromUpstream(Frame),
     UpstreamClosed(String),
     FromClient(ClientId, Frame),
     Attach {
         id: ClientId,
-        tx: mpsc::Sender<Frame>,
+        tx: mpsc::Sender<ClientOutput>,
         username: String,
         uuid: Uuid,
     },
     Detach(ClientId),
+    ReplayBatchFinished {
+        id: ClientId,
+        success: bool,
+    },
     /// Once-a-second timer: while controllerless, the stand-in must
     /// report the player's position like an idle client would.
     StandInTick,
+}
+
+pub(crate) enum ClientOutput {
+    Frame(Frame),
+    /// A writer-side barrier. The acknowledgement is sent only after all
+    /// preceding frames have been written to the socket.
+    Flush(oneshot::Sender<()>),
 }
 
 enum ClientState {
@@ -69,12 +82,16 @@ enum ClientState {
     /// Config replay sent; waiting for the client's serverbound
     /// FinishConfiguration ack.
     Joining,
+    /// A potentially large game-state replay is being written with
+    /// backpressure. Live frames arriving meanwhile are retained here
+    /// and sent in a subsequent ordered catch-up batch.
+    Replaying { pending: Vec<Frame> },
     /// Receiving live broadcast.
     Live,
 }
 
 struct ClientHandle {
-    tx: mpsc::Sender<Frame>,
+    tx: mpsc::Sender<ClientOutput>,
     state: ClientState,
     username: String,
     uuid: Uuid,
@@ -166,6 +183,7 @@ enum UpstreamState {
 }
 
 struct Session {
+    message_tx: mpsc::Sender<SessionMsg>,
     pipeline: Arc<Pipeline>,
     upstream_tx: mpsc::Sender<Frame>,
     clients: HashMap<ClientId, ClientHandle>,
@@ -240,7 +258,7 @@ pub fn spawn(
     // blocking await (that would let a slow bot stall the whole actor),
     // so this bound is a memory ceiling / "hopelessly behind" tripwire,
     // sized to absorb a full render-distance warp burst.
-    let (ctl_tx, ctl_rx) = mpsc::channel::<Frame>(16384);
+    let (ctl_tx, ctl_rx) = mpsc::channel::<ClientOutput>(16384);
     let mut clients = HashMap::new();
     clients.insert(
         controller_id,
@@ -266,6 +284,7 @@ pub fn spawn(
 
     let cache = JoinCache::new(bot_uuid);
     let session = Session {
+        message_tx: msg_tx.clone(),
         pipeline,
         upstream_tx,
         clients,
@@ -311,9 +330,10 @@ pub async fn attach_viewer(
     id: ClientId,
     client: LocalClient,
 ) -> Result<()> {
-    // Sized for the worst-case join replay: a render-distance-32 world
-    // is ~4200 cached chunk frames queued in one burst.
-    let (tx, rx) = mpsc::channel::<Frame>(8192);
+    // Live traffic remains bounded. Large join replays use async
+    // backpressure and therefore no longer depend on fitting in this
+    // channel all at once.
+    let (tx, rx) = mpsc::channel::<ClientOutput>(8192);
     session_tx
         .send(SessionMsg::Attach {
             id,
@@ -396,18 +416,25 @@ fn start_client_io(
     id: ClientId,
     conn: Connection<ServerboundConfigPacket, ClientboundConfigPacket>,
     msg_tx: mpsc::Sender<SessionMsg>,
-    mut frame_rx: mpsc::Receiver<Frame>,
+    mut frame_rx: mpsc::Receiver<ClientOutput>,
 ) {
     let (read, write) = conn.into_split_raw();
 
     let writer_msg_tx = msg_tx.clone();
     tokio::spawn(async move {
         let mut sink = AzaleaFrameSink { writer: write };
-        while let Some(f) = frame_rx.recv().await {
-            if let Err(e) = sink.write_frame(f).await {
-                tracing::debug!("client {id} write failed: {e:#}");
-                let _ = writer_msg_tx.send(SessionMsg::Detach(id)).await;
-                break;
+        while let Some(output) = frame_rx.recv().await {
+            match output {
+                ClientOutput::Frame(frame) => {
+                    if let Err(e) = sink.write_frame(frame).await {
+                        tracing::debug!("client {id} write failed: {e:#}");
+                        let _ = writer_msg_tx.send(SessionMsg::Detach(id)).await;
+                        break;
+                    }
+                }
+                ClientOutput::Flush(done) => {
+                    let _ = done.send(());
+                }
             }
         }
     });
@@ -428,6 +455,32 @@ fn start_client_io(
                 }
             }
         }
+    });
+}
+
+fn spawn_client_batch(
+    id: ClientId,
+    frames: Vec<Frame>,
+    tx: mpsc::Sender<ClientOutput>,
+    message_tx: mpsc::Sender<SessionMsg>,
+) {
+    tokio::spawn(async move {
+        let mut success = true;
+        for frame in frames {
+            if tx.send(ClientOutput::Frame(frame)).await.is_err() {
+                success = false;
+                break;
+            }
+        }
+
+        if success {
+            let (done_tx, done_rx) = oneshot::channel();
+            success = tx.send(ClientOutput::Flush(done_tx)).await.is_ok() && done_rx.await.is_ok();
+        }
+
+        let _ = message_tx
+            .send(SessionMsg::ReplayBatchFinished { id, success })
+            .await;
     });
 }
 
@@ -453,6 +506,9 @@ impl Session {
                     uuid,
                 } => self.on_attach(id, tx, username, uuid),
                 SessionMsg::Detach(id) => self.drop_client(id, "disconnected"),
+                SessionMsg::ReplayBatchFinished { id, success } => {
+                    self.on_replay_batch_finished(id, success)
+                }
                 SessionMsg::StandInTick => self.stand_in_tick().await,
             }
             if self.clients.is_empty() {
@@ -894,7 +950,7 @@ impl Session {
 
         let is_join_ack = matches!(
             self.clients.get(&id),
-            Some(c) if matches!(c.state, ClientState::Joining)
+            Some(c) if matches!(&c.state, ClientState::Joining)
         ) && frame.packet_id == ids::SB_CONFIG_FINISH;
 
         if is_join_ack {
@@ -910,27 +966,16 @@ impl Session {
             queue.extend(reflect::viewer_kit(uuid, &name, self.real_game_mode));
             queue.extend(self.cache.world.self_hud_frames());
             queue.extend(self.reflected_bundle());
+            let frame_count = queue.len();
             let c = self.clients.get_mut(&id).expect("checked above");
-            let mut ok = true;
-            for f in queue {
-                if c.tx.try_send(f).is_err() {
-                    ok = false;
-                    break;
-                }
-            }
-            if ok {
-                c.state = ClientState::Live;
-                tracing::info!("viewer {id} ('{}') is live", c.username);
-            } else {
-                self.drop_client(id, "queue overflow during join");
-            }
-            if ok
-                && self.controller.is_none()
-                && self.opts.always_first_control
-                && self.promote_to_controller(id)
-            {
-                self.feedback(id, "you have control now (always_first_control)");
-            }
+            c.state = ClientState::Replaying {
+                pending: Vec::new(),
+            };
+            tracing::info!(
+                "viewer {id} ('{}') game replay started ({frame_count} frames)",
+                c.username
+            );
+            self.start_replay_batch(id, queue);
         }
         Ok(())
     }
@@ -1140,9 +1185,11 @@ impl Session {
     }
 
     fn feedback(&mut self, id: ClientId, msg: &str) {
-        if let Some(c) = self.clients.get(&id) {
-            let _ = c.tx.try_send(reflect::system_chat_frame(msg));
-        }
+        self.queue_frames(
+            id,
+            [reflect::system_chat_frame(msg)],
+            "queue overflow while sending command feedback",
+        );
     }
 
     fn reflected_bundle(&self) -> Vec<Frame> {
@@ -1184,7 +1231,7 @@ impl Session {
             .iter()
             .filter(|(&id, client)| {
                 Some(id) != self.controller
-                    && matches!(client.state, ClientState::Live)
+                    && matches!(&client.state, ClientState::Live)
                     && client.camera_target == Some(CameraTarget::Bot)
             })
             .map(|(&id, _)| id)
@@ -1204,7 +1251,7 @@ impl Session {
             .iter()
             .filter(|(&id, client)| {
                 Some(id) != self.controller
-                    && matches!(client.state, ClientState::Live)
+                    && matches!(&client.state, ClientState::Live)
                     && client.camera_target == Some(CameraTarget::Player(uuid))
             })
             .map(|(&id, _)| id)
@@ -1275,7 +1322,8 @@ impl Session {
             .clients
             .iter()
             .filter(|(&cid, c)| {
-                Some(cid) != self.controller && matches!(c.state, ClientState::Live)
+                Some(cid) != self.controller
+                    && matches!(&c.state, ClientState::Live | ClientState::Replaying { .. })
             })
             .map(|(&cid, c)| (cid, c.uuid, c.username.clone()))
             .collect();
@@ -1286,15 +1334,21 @@ impl Session {
         }
     }
 
-    fn on_attach(&mut self, id: ClientId, tx: mpsc::Sender<Frame>, username: String, uuid: Uuid) {
+    fn on_attach(
+        &mut self,
+        id: ClientId,
+        tx: mpsc::Sender<ClientOutput>,
+        username: String,
+        uuid: Uuid,
+    ) {
         if let Some(max) = self.opts.max_clients {
             if self.clients.len() >= max {
                 tracing::info!("refusing viewer {id} ('{username}'): max_clients={max} reached");
                 use azalea_chat::FormattedText;
                 use azalea_protocol::packets::config::c_disconnect::ClientboundDisconnect;
-                let _ = tx.try_send(ids::frame_of(ClientboundDisconnect {
+                let _ = tx.try_send(ClientOutput::Frame(ids::frame_of(ClientboundDisconnect {
                     reason: FormattedText::from("this proxy has reached its client limit"),
-                }));
+                })));
                 // Dropping tx after the queued disconnect closes the writer
                 // and socket once the message has been sent.
                 return;
@@ -1336,7 +1390,7 @@ impl Session {
             };
             let mut ok = true;
             for f in frames {
-                if c.tx.try_send(f).is_err() {
+                if c.tx.try_send(ClientOutput::Frame(f)).is_err() {
                     ok = false;
                     break;
                 }
@@ -1351,11 +1405,57 @@ impl Session {
         }
     }
 
+    fn start_replay_batch(&self, id: ClientId, frames: Vec<Frame>) {
+        let Some(client) = self.clients.get(&id) else {
+            return;
+        };
+        spawn_client_batch(id, frames, client.tx.clone(), self.message_tx.clone());
+    }
+
+    fn on_replay_batch_finished(&mut self, id: ClientId, success: bool) {
+        if !success {
+            self.drop_client(id, "connection closed during game replay");
+            return;
+        }
+
+        let (pending, became_live, username) = {
+            let Some(client) = self.clients.get_mut(&id) else {
+                return;
+            };
+            let ClientState::Replaying { pending } = &mut client.state else {
+                return;
+            };
+            let pending = std::mem::take(pending);
+            if pending.is_empty() {
+                client.state = ClientState::Live;
+                (pending, true, client.username.clone())
+            } else {
+                (pending, false, client.username.clone())
+            }
+        };
+
+        if became_live {
+            tracing::info!("viewer {id} ('{username}') is live");
+            if self.controller.is_none()
+                && self.opts.always_first_control
+                && self.promote_to_controller(id)
+            {
+                self.feedback(id, "you have control now (always_first_control)");
+            }
+        } else {
+            tracing::debug!(
+                "viewer {id} ('{username}') replay catch-up batch: {} frames",
+                pending.len()
+            );
+            self.start_replay_batch(id, pending);
+        }
+    }
+
     fn flush_parked(&mut self) {
         let parked: Vec<ClientId> = self
             .clients
             .iter()
-            .filter(|(_, c)| matches!(c.state, ClientState::Parked))
+            .filter(|(_, c)| matches!(&c.state, ClientState::Parked))
             .map(|(&id, _)| id)
             .collect();
         for id in parked {
@@ -1416,17 +1516,29 @@ impl Session {
         }
         let viewers_receive = self.viewers_receive(&frame);
         let mut dead = Vec::new();
-        for (&id, c) in self.clients.iter() {
-            if !matches!(c.state, ClientState::Live) {
+        for (&id, c) in self.clients.iter_mut() {
+            let deliver = Some(id) == self.controller || viewers_receive;
+            if !deliver {
                 continue;
             }
-            let deliver = Some(id) == self.controller || viewers_receive;
-            if deliver && c.tx.try_send(frame.clone()).is_err() {
-                dead.push(id);
+            match &mut c.state {
+                ClientState::Live => {
+                    if c.tx.try_send(ClientOutput::Frame(frame.clone())).is_err() {
+                        dead.push(id);
+                    }
+                }
+                ClientState::Replaying { pending } => {
+                    if pending.len() >= MAX_REPLAY_PENDING_FRAMES {
+                        dead.push(id);
+                    } else {
+                        pending.push(frame.clone());
+                    }
+                }
+                ClientState::Parked | ClientState::Joining => {}
             }
         }
         for id in dead {
-            self.drop_client(id, "send failed or fell behind");
+            self.drop_client(id, "send failed or replay catch-up backlog exceeded");
         }
     }
 
@@ -1434,16 +1546,31 @@ impl Session {
     /// Live viewer, never the controller.
     fn send_to_viewers(&mut self, frames: &[Frame]) {
         let mut dead = Vec::new();
-        for (&id, c) in self.clients.iter() {
-            if Some(id) == self.controller || !matches!(c.state, ClientState::Live) {
+        for (&id, c) in self.clients.iter_mut() {
+            if Some(id) == self.controller {
                 continue;
             }
-            if !frames.iter().all(|f| c.tx.try_send(f.clone()).is_ok()) {
-                dead.push(id);
+            match &mut c.state {
+                ClientState::Live => {
+                    if !frames
+                        .iter()
+                        .all(|f| c.tx.try_send(ClientOutput::Frame(f.clone())).is_ok())
+                    {
+                        dead.push(id);
+                    }
+                }
+                ClientState::Replaying { pending } => {
+                    if pending.len().saturating_add(frames.len()) > MAX_REPLAY_PENDING_FRAMES {
+                        dead.push(id);
+                    } else {
+                        pending.extend(frames.iter().cloned());
+                    }
+                }
+                ClientState::Parked | ClientState::Joining => {}
             }
         }
         for id in dead {
-            self.drop_client(id, "send failed or fell behind");
+            self.drop_client(id, "send failed or replay catch-up backlog exceeded");
         }
     }
 
@@ -1481,7 +1608,7 @@ impl Session {
     fn oldest_live_client(&self, exclude: Option<ClientId>) -> Option<ClientId> {
         self.clients
             .iter()
-            .filter(|(cid, c)| Some(**cid) != exclude && matches!(c.state, ClientState::Live))
+            .filter(|(cid, c)| Some(**cid) != exclude && matches!(&c.state, ClientState::Live))
             .map(|(&cid, _)| cid)
             .min()
     }
@@ -1502,13 +1629,28 @@ impl Session {
         frames: impl IntoIterator<Item = Frame>,
         failure_reason: &str,
     ) -> bool {
-        let Some(client) = self.clients.get(&id) else {
+        let Some(client) = self.clients.get_mut(&id) else {
             return false;
         };
-        if frames
-            .into_iter()
-            .any(|frame| client.tx.try_send(frame).is_err())
-        {
+        let mut failed = false;
+        for frame in frames {
+            match &mut client.state {
+                ClientState::Replaying { pending } => {
+                    if pending.len() >= MAX_REPLAY_PENDING_FRAMES {
+                        failed = true;
+                        break;
+                    }
+                    pending.push(frame);
+                }
+                ClientState::Parked | ClientState::Joining | ClientState::Live => {
+                    if client.tx.try_send(ClientOutput::Frame(frame)).is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if failed {
             self.drop_client(id, failure_reason);
             false
         } else {
@@ -1548,5 +1690,46 @@ mod tests {
             .filter_map(|frame| ids::chunk_key(&frame.body))
             .collect();
         assert_eq!(chunks, [(0, 0), (1, 0), (-2, 0), (8, 8)]);
+    }
+
+    #[tokio::test]
+    async fn replay_batch_exceeds_the_old_queue_limit_without_disconnect() {
+        let frame_count = 9_000;
+        let frames = (0..frame_count)
+            .map(|packet_id| Frame {
+                packet_id,
+                body: Vec::new(),
+            })
+            .collect();
+        // Deliberately tiny: the batch sender must wait for the writer
+        // instead of treating normal backpressure as a disconnect.
+        let (output_tx, mut output_rx) = mpsc::channel::<ClientOutput>(2);
+        let (message_tx, mut message_rx) = mpsc::channel::<SessionMsg>(2);
+        spawn_client_batch(7, frames, output_tx, message_tx);
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut received = 0;
+            while let Some(output) = output_rx.recv().await {
+                match output {
+                    ClientOutput::Frame(frame) => {
+                        assert_eq!(frame.packet_id, received);
+                        received += 1;
+                    }
+                    ClientOutput::Flush(done) => {
+                        let _ = done.send(());
+                        break;
+                    }
+                }
+            }
+            received
+        })
+        .await
+        .expect("backpressured replay should finish");
+        assert_eq!(received, frame_count);
+
+        match message_rx.recv().await {
+            Some(SessionMsg::ReplayBatchFinished { id: 7, success }) => assert!(success),
+            _ => panic!("expected successful replay completion"),
+        }
     }
 }

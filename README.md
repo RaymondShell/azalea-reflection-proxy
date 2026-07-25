@@ -119,9 +119,11 @@ tokio::spawn(async move {
   FinishConfiguration, then Login, Respawn (if the session changed
   dimension), position, Game Event 13, the full raw chunk cache, and
   the world snapshot. Chunks are replayed nearest the current center
-  first so terrain around the player becomes useful sooner. Chunk
-  replay is a hard requirement: the vanilla client won't leave
-  "Loading terrain..." until the chunk under its feet loads.
+  first so terrain around the player becomes useful sooner. Large
+  replays use socket backpressure instead of a fixed frame-count queue;
+  live updates are buffered and caught up in order before the viewer
+  becomes live. Chunk replay is a hard requirement: the vanilla client
+  won't leave "Loading terrain..." until the chunk under its feet loads.
 - World snapshot (`snapshot.rs`) — the snapshot.js port: changed blocks
   and block entities since each cached chunk, biome and light updates,
   entities (with positions accumulated from movement and latest velocity),
