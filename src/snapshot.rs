@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Cursor;
 use std::time::Instant;
 
-use azalea_buf::AzBufVar;
+use azalea_buf::{AzBuf, AzBufVar};
 use azalea_core::entity_id::MinecraftEntityId;
 use azalea_core::math;
 use azalea_core::position::{BlockPos, Vec3};
@@ -212,8 +212,124 @@ impl BorderState {
 }
 
 struct TeamRecord {
-    parameters: azalea_protocol::packets::game::c_set_player_team::Parameters,
+    /// Original 26.2 Add packet, including the opaque Parameters payload.
+    ///
+    /// Azalea 0.16 still models the old mandatory ChatFormatting color,
+    /// while 26.2 sends Optional<TeamColor>. Re-encoding Parameters through
+    /// Azalea shifts the options and player-list fields and disconnects
+    /// vanilla clients, so parameter-bearing packets stay byte-for-byte.
+    add: Frame,
+    /// Only the latest Change is needed because it replaces all parameters.
+    change: Option<Frame>,
+    /// Membership carried by `add`, used to compact later Join/Leave packets.
+    baseline_players: HashSet<String>,
+    /// Current membership after applying all subsequent Join/Leave packets.
     players: HashSet<String>,
+}
+
+enum TeamUpdate {
+    Add {
+        name: String,
+        players: HashSet<String>,
+    },
+    Remove {
+        name: String,
+    },
+    Change {
+        name: String,
+    },
+    Join {
+        name: String,
+        players: Vec<String>,
+    },
+    Leave {
+        name: String,
+        players: Vec<String>,
+    },
+}
+
+/// Parse the 26.2 team Parameters only far enough to locate the following
+/// player list. Parameter bytes are never reconstructed.
+///
+/// 26.2 changed the color field from ChatFormatting to Optional<TeamColor>.
+/// Keeping this small parser local avoids using Azalea's stale team schema
+/// while still using its current component codec.
+fn read_team_parameters_26_2(cur: &mut Cursor<&[u8]>) -> Option<()> {
+    for _ in 0..3 {
+        azalea_chat::FormattedText::azalea_read(cur).ok()?;
+    }
+
+    let name_tag_visibility = u32::azalea_read_var(cur).ok()?;
+    let collision_rule = u32::azalea_read_var(cur).ok()?;
+    if name_tag_visibility > 3 || collision_rule > 3 {
+        return None;
+    }
+
+    if bool::azalea_read(cur).ok()? {
+        let color = u32::azalea_read_var(cur).ok()?;
+        if color > 15 {
+            return None;
+        }
+    }
+    u8::azalea_read(cur).ok()?;
+    Some(())
+}
+
+fn read_team_players(cur: &mut Cursor<&[u8]>) -> Option<Vec<String>> {
+    let players = Vec::<String>::azalea_read(cur).ok()?;
+    (cur.position() == cur.get_ref().len() as u64).then_some(players)
+}
+
+/// Decode only the stable outer team shape using Minecraft 26.2's layout.
+fn team_update_26_2(frame: &Frame) -> Option<TeamUpdate> {
+    let mut cur = Cursor::new(frame.body.as_ref());
+    let name = String::azalea_read(&mut cur).ok()?;
+    let method = u8::azalea_read(&mut cur).ok()?;
+
+    match method {
+        0 => {
+            read_team_parameters_26_2(&mut cur)?;
+            let players = read_team_players(&mut cur)?.into_iter().collect();
+            Some(TeamUpdate::Add { name, players })
+        }
+        1 if cur.position() == frame.body.len() as u64 => Some(TeamUpdate::Remove { name }),
+        2 => {
+            read_team_parameters_26_2(&mut cur)?;
+            (cur.position() == frame.body.len() as u64).then_some(TeamUpdate::Change { name })
+        }
+        3 => Some(TeamUpdate::Join {
+            name,
+            players: read_team_players(&mut cur)?,
+        }),
+        4 => Some(TeamUpdate::Leave {
+            name,
+            players: read_team_players(&mut cur)?,
+        }),
+        _ => None,
+    }
+}
+
+/// Join/Leave packets contain no version-sensitive Parameters, so they can
+/// be compacted into one deterministic packet of each kind.
+fn team_membership_frame(name: &str, method: u8, players: &[String]) -> Frame {
+    debug_assert!(matches!(method, 3 | 4));
+    let mut body = Vec::new();
+    name.to_owned()
+        .azalea_write(&mut body)
+        .expect("writing to a Vec cannot fail");
+    method
+        .azalea_write(&mut body)
+        .expect("writing to a Vec cannot fail");
+    u32::try_from(players.len())
+        .expect("a team player list cannot exceed the protocol's u32 length")
+        .azalea_write_var(&mut body)
+        .expect("writing to a Vec cannot fail");
+    for player in players {
+        player
+            .azalea_write(&mut body)
+            .expect("writing to a Vec cannot fail");
+    }
+    Frame::new(ids::CB_GAME_SET_PLAYER_TEAM, body)
 }
 
 struct EntityRecord {
@@ -790,33 +906,34 @@ impl WorldSnapshot {
                 }
             }
             ids::CB_GAME_SET_PLAYER_TEAM => {
-                use azalea_protocol::packets::game::c_set_player_team::Method;
-                if let Some(ClientboundGamePacket::SetPlayerTeam(p)) = typed(f) {
-                    match p.method {
-                        Method::Remove => {
-                            self.teams.remove(&p.name);
+                if let Some(update) = team_update_26_2(f) {
+                    match update {
+                        TeamUpdate::Remove { name } => {
+                            self.teams.remove(&name);
                         }
-                        Method::Add((parameters, players)) => {
+                        TeamUpdate::Add { name, players } => {
                             self.teams.insert(
-                                p.name,
+                                name,
                                 TeamRecord {
-                                    parameters,
-                                    players: players.into_iter().collect(),
+                                    add: f.clone(),
+                                    change: None,
+                                    baseline_players: players.clone(),
+                                    players,
                                 },
                             );
                         }
-                        Method::Change(parameters) => {
-                            if let Some(team) = self.teams.get_mut(&p.name) {
-                                team.parameters = parameters;
+                        TeamUpdate::Change { name } => {
+                            if let Some(team) = self.teams.get_mut(&name) {
+                                team.change = Some(f.clone());
                             }
                         }
-                        Method::Join(players) => {
-                            if let Some(team) = self.teams.get_mut(&p.name) {
+                        TeamUpdate::Join { name, players } => {
+                            if let Some(team) = self.teams.get_mut(&name) {
                                 team.players.extend(players);
                             }
                         }
-                        Method::Leave(players) => {
-                            if let Some(team) = self.teams.get_mut(&p.name) {
+                        TeamUpdate::Leave { name, players } => {
+                            if let Some(team) = self.teams.get_mut(&name) {
                                 for player in players {
                                     team.players.remove(&player);
                                 }
@@ -1089,7 +1206,6 @@ impl WorldSnapshot {
         use azalea_protocol::packets::game::c_set_equipment::{
             ClientboundSetEquipment, EquipmentSlots,
         };
-        use azalea_protocol::packets::game::c_set_player_team::{ClientboundSetPlayerTeam, Method};
         use azalea_protocol::packets::game::c_update_attributes::ClientboundUpdateAttributes;
 
         let mut q = Vec::new();
@@ -1194,12 +1310,28 @@ impl WorldSnapshot {
         team_names.sort_unstable();
         for name in team_names {
             let team = &self.teams[name];
-            let mut players: Vec<_> = team.players.iter().cloned().collect();
-            players.sort_unstable();
-            q.push(frame_of(ClientboundSetPlayerTeam {
-                name: name.clone(),
-                method: Method::Add((team.parameters.clone(), players)),
-            }));
+            q.push(team.add.clone());
+            q.extend(team.change.iter().cloned());
+
+            let mut joins: Vec<_> = team
+                .players
+                .difference(&team.baseline_players)
+                .cloned()
+                .collect();
+            joins.sort_unstable();
+            if !joins.is_empty() {
+                q.push(team_membership_frame(name, 3, &joins));
+            }
+
+            let mut leaves: Vec<_> = team
+                .baseline_players
+                .difference(&team.players)
+                .cloned()
+                .collect();
+            leaves.sort_unstable();
+            if !leaves.is_empty() {
+                q.push(team_membership_frame(name, 4, &leaves));
+            }
         }
 
         let mut displays: Vec<_> = self.displays.iter().collect();
@@ -1494,6 +1626,27 @@ mod tests {
             y_head_rot: 0,
             data: 0,
         })
+    }
+
+    fn team_add_frame_26_2(name: &str, players: &[&str]) -> Frame {
+        let mut body = Vec::new();
+        name.to_owned().azalea_write(&mut body).unwrap();
+        0u8.azalea_write(&mut body).unwrap();
+        FormattedText::from(name).azalea_write(&mut body).unwrap();
+        FormattedText::from("[").azalea_write(&mut body).unwrap();
+        FormattedText::from("]").azalea_write(&mut body).unwrap();
+        0u32.azalea_write_var(&mut body).unwrap();
+        0u32.azalea_write_var(&mut body).unwrap();
+        true.azalea_write(&mut body).unwrap();
+        15u32.azalea_write_var(&mut body).unwrap();
+        0u8.azalea_write(&mut body).unwrap();
+        players
+            .iter()
+            .map(|player| (*player).to_owned())
+            .collect::<Vec<_>>()
+            .azalea_write(&mut body)
+            .unwrap();
+        Frame::new(ids::CB_GAME_SET_PLAYER_TEAM, body)
     }
 
     /// A viewer that missed the Add must still get one on join, carrying
@@ -2018,16 +2171,46 @@ mod tests {
     }
 
     #[test]
+    fn team_replay_preserves_26_2_parameters_and_compacts_membership() {
+        let add = team_add_frame_26_2("format", &["line", "gone"]);
+        let join = team_membership_frame("format", 3, &["new".to_owned()]);
+        let leave = team_membership_frame("format", 4, &["gone".to_owned()]);
+        let mut snap = WorldSnapshot::default();
+        snap.observe(&add);
+        snap.observe(&join);
+        snap.observe(&leave);
+
+        let replayed: Vec<_> = snap
+            .replay()
+            .into_iter()
+            .filter(|frame| frame.packet_id == ids::CB_GAME_SET_PLAYER_TEAM)
+            .collect();
+        assert_eq!(replayed.len(), 3);
+        assert_eq!(replayed[0].body, add.body);
+
+        match team_update_26_2(&replayed[1]) {
+            Some(TeamUpdate::Join { name, players }) => {
+                assert_eq!(name, "format");
+                assert_eq!(players, ["new"]);
+            }
+            _ => panic!("expected a valid 26.2 Join packet"),
+        }
+        match team_update_26_2(&replayed[2]) {
+            Some(TeamUpdate::Leave { name, players }) => {
+                assert_eq!(name, "format");
+                assert_eq!(players, ["gone"]);
+            }
+            _ => panic!("expected a valid 26.2 Leave packet"),
+        }
+    }
+
+    #[test]
     fn scoreboard_replay_orders_dependencies_first() {
-        use azalea_chat::{numbers::NumberFormat, style::ChatFormatting};
+        use azalea_chat::numbers::NumberFormat;
         use azalea_core::objectives::ObjectiveCriteria;
         use azalea_protocol::packets::game::{
             c_set_display_objective::{ClientboundSetDisplayObjective, DisplaySlot},
             c_set_objective::{ClientboundSetObjective, Method as ObjectiveMethod},
-            c_set_player_team::{
-                ClientboundSetPlayerTeam, CollisionRule, Method as TeamMethod, NameTagVisibility,
-                Parameters,
-            },
             c_set_score::ClientboundSetScore,
         };
 
@@ -2043,21 +2226,7 @@ mod tests {
             slot: DisplaySlot::Sidebar,
             objective_name: "sidebar".to_string(),
         }));
-        snap.observe(&frame_of(ClientboundSetPlayerTeam {
-            name: "format".to_string(),
-            method: TeamMethod::Add((
-                Parameters {
-                    display_name: FormattedText::from("format"),
-                    player_prefix: FormattedText::from("["),
-                    player_suffix: FormattedText::from("]"),
-                    nametag_visibility: NameTagVisibility::Always,
-                    collision_rule: CollisionRule::Always,
-                    color: ChatFormatting::White,
-                    options: 0,
-                },
-                vec!["line".to_string()],
-            )),
-        }));
+        snap.observe(&team_add_frame_26_2("format", &["line"]));
         snap.observe(&frame_of(ClientboundSetObjective {
             objective_name: "sidebar".to_string(),
             method: ObjectiveMethod::Add {
@@ -2070,17 +2239,12 @@ mod tests {
         let kinds: Vec<_> = snap
             .replay()
             .into_iter()
-            .filter_map(|frame| {
-                match ClientboundGamePacket::read(
-                    frame.packet_id,
-                    &mut Cursor::new(frame.body.as_ref()),
-                ) {
-                    Ok(ClientboundGamePacket::SetObjective(_)) => Some("objective"),
-                    Ok(ClientboundGamePacket::SetPlayerTeam(_)) => Some("team"),
-                    Ok(ClientboundGamePacket::SetDisplayObjective(_)) => Some("display"),
-                    Ok(ClientboundGamePacket::SetScore(_)) => Some("score"),
-                    _ => None,
-                }
+            .filter_map(|frame| match frame.packet_id {
+                ids::CB_GAME_SET_OBJECTIVE => Some("objective"),
+                ids::CB_GAME_SET_PLAYER_TEAM => Some("team"),
+                ids::CB_GAME_SET_DISPLAY_OBJECTIVE => Some("display"),
+                ids::CB_GAME_SET_SCORE => Some("score"),
+                _ => None,
             })
             .collect();
         assert_eq!(kinds, ["objective", "team", "display", "score"]);
