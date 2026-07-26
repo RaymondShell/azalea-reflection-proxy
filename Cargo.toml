@@ -14,25 +14,17 @@ categories = ["game-development", "network-programming"]
 exclude = [".github/", ".idea/"]
 
 [dependencies]
-# Track azalea's git `main` — the proxy must speak the exact same protocol
-# version the bot does, and bots built against git are on the newest
-# Minecraft protocol (currently 0.16.0+mc26.2), which the crates.io 0.16
-# release (mc26.1) does not yet carry. The manifest and Cargo.lock pin
-# the exact commit.
-# Cargo requires a crates.io version for publishing and strips `git` from
-# the packaged manifest. Build metadata cannot be selected in a dependency
-# requirement, so the compile-time protocol assertion in src/lib.rs rejects
-# the crates.io mc26.1 release instead of silently producing an incompatible
-# package. Publish once the 26.2 Azalea crates are available on crates.io.
-azalea-protocol = { version = "=0.16.0", git = "https://github.com/RaymondShell/azalea", rev = "c3094e4b92c8856a611d618da692b8decf315d87" }
-azalea-auth = { version = "=0.16.0", git = "https://github.com/RaymondShell/azalea", rev = "c3094e4b92c8856a611d618da692b8decf315d87" }
-azalea-crypto = { version = "=0.16.0", git = "https://github.com/RaymondShell/azalea", rev = "c3094e4b92c8856a611d618da692b8decf315d87" }
-azalea-buf = { version = "=0.16.0", git = "https://github.com/RaymondShell/azalea", rev = "c3094e4b92c8856a611d618da692b8decf315d87" }
-azalea-chat = { version = "=0.16.0", git = "https://github.com/RaymondShell/azalea", rev = "c3094e4b92c8856a611d618da692b8decf315d87" }
-azalea-core = { version = "=0.16.0", git = "https://github.com/RaymondShell/azalea", rev = "c3094e4b92c8856a611d618da692b8decf315d87", features = ["bevy_ecs"] }
-azalea-entity = { version = "=0.16.0", git = "https://github.com/RaymondShell/azalea", rev = "c3094e4b92c8856a611d618da692b8decf315d87" }
-azalea-registry = { version = "=0.16.0", git = "https://github.com/RaymondShell/azalea", rev = "c3094e4b92c8856a611d618da692b8decf315d87" }
-azalea-inventory = { version = "=0.16.0", git = "https://github.com/RaymondShell/azalea", rev = "c3094e4b92c8856a611d618da692b8decf315d87" }
+# Track the fork's latest `main` so the proxy and bot resolve one shared
+# protocol stack rather than compiling separate Azalea revisions.
+azalea-protocol = { git = "https://github.com/RaymondShell/azalea", branch = "main" }
+azalea-auth = { git = "https://github.com/RaymondShell/azalea", branch = "main" }
+azalea-crypto = { git = "https://github.com/RaymondShell/azalea", branch = "main" }
+azalea-buf = { git = "https://github.com/RaymondShell/azalea", branch = "main" }
+azalea-chat = { git = "https://github.com/RaymondShell/azalea", branch = "main" }
+azalea-core = { git = "https://github.com/RaymondShell/azalea", branch = "main", features = ["bevy_ecs"] }
+azalea-entity = { git = "https://github.com/RaymondShell/azalea", branch = "main" }
+azalea-registry = { git = "https://github.com/RaymondShell/azalea", branch = "main" }
+azalea-inventory = { git = "https://github.com/RaymondShell/azalea", branch = "main" }
 # same crate/version azalea-client uses to locate ~/.minecraft, so the
 # proxy's auth cache path is identical to Account::microsoft's
 minecraft_folder_path = "0.1.2"

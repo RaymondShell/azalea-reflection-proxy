@@ -23,13 +23,14 @@ at most once per account).
 
 ## Usage
 
-Until the compatible 26.2 dependency set is available on crates.io, use
-a local checkout of the crate:
+Track the proxy's latest `master` branch alongside the latest Azalea fork:
 
 ```toml
 [dependencies]
-azalea-reflection-proxy = { path = "../azalea-reflection-proxy" }
+azalea-reflection-proxy = { git = "https://github.com/RaymondShell/azalea-reflection-proxy", branch = "master" }
 ```
+
+Run `cargo update -p azalea-protocol` before building to refresh Azalea.
 
 Spawn the proxy in-process and point your azalea bot at it — two changed
 lines relative to a normal bot:
@@ -52,8 +53,8 @@ ClientBuilder::new()
 Spectate by adding a vanilla-client server entry for the same address
 (default `0.0.0.0:25566`; `.bind("127.0.0.1:0")` restricts it to a local,
 OS-assigned free port).
-The client must be Minecraft 26.2 (protocol 776), matching the pinned
-Azalea git revision. A compile-time assertion deliberately rejects older
+The client must be Minecraft 26.2 (protocol 776), matching the current
+Azalea `main` branch. A compile-time assertion deliberately rejects older
 Azalea protocol revisions, including the current crates.io mc26.1 build.
 A standalone binary (`cargo run`, configured via `PROXY_EMAIL` /
 `PROXY_TARGET` / `PROXY_BIND` / `PROXY_AUTH_CACHE`,
@@ -182,12 +183,9 @@ parses that one packet.
 
 ## Status
 
-Everything above is implemented. The crate is temporarily marked
-`publish = false`: Cargo strips git sources from a published manifest,
-but crates.io's Azalea 0.16 packages still speak Minecraft 26.1 while
-this proxy intentionally requires the pinned 26.2 revision. Re-enable
-publishing only after compatible Azalea packages are on crates.io and a
-clean `cargo publish --dry-run --locked` succeeds.
+Everything above is implemented. The crate is marked `publish = false`
+because it intentionally follows the fork's moving Azalea `main` branch
+rather than a crates.io release.
 
 The passthrough and replicator paths
 (bot through proxy, viewer join, terrain) and the viewer HUD have been
@@ -209,9 +207,8 @@ is not carried over.
   original's `createBotReflected` integration mode forces
   (`noLimbo: true`); a limbo lobby only matters for its standalone
   public-server mode.
-- `version` option — this release intentionally supports only Minecraft
-  26.2 (protocol 776), pinned by the Azalea git revision and enforced at
-  compile time.
+- `version` option — this release intentionally supports only the protocol
+  used by the current Azalea `main` branch, enforced at compile time.
 - Physics simulation while uncontrolled — the original hosts a
   mineflayer bot in-process and re-enables its physics; here the bot
   is your own azalea process, so the proxy stands in (keepalives +
