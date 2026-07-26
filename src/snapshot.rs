@@ -9,7 +9,7 @@
 //! get one bounded, internally consistent reconstruction; opaque state
 //! is retained as raw frames and replayed verbatim.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Cursor;
 use std::time::Instant;
 
@@ -28,6 +28,59 @@ use crate::ids::{self, frame_of};
 use crate::plugin::Frame;
 
 const MAX_CACHED_MAPS: usize = 256;
+const MAX_METADATA_HISTORY_FRAMES: usize = 64;
+const MAX_METADATA_HISTORY_BYTES: usize = 256 * 1024;
+
+/// A byte- and count-bounded sequence of complete server metadata packets.
+///
+/// The first packet is normally the entity's full initial metadata and is
+/// retained as a baseline. Recent deltas are replayed in their original order.
+/// Treating packet bodies as opaque is essential: finding individual item
+/// boundaries requires decoding every nested metadata serializer, and one
+/// codec mismatch corrupts every item that follows it.
+#[derive(Default)]
+struct MetadataHistory {
+    baseline: Option<Frame>,
+    deltas: VecDeque<Frame>,
+    bytes: usize,
+}
+
+impl MetadataHistory {
+    fn push(&mut self, frame: Frame) {
+        let frame_bytes = frame.queued_bytes();
+        if frame_bytes > MAX_METADATA_HISTORY_BYTES {
+            return;
+        }
+        if self.baseline.is_none() {
+            self.bytes = frame_bytes;
+            self.baseline = Some(frame);
+            return;
+        }
+
+        self.bytes = self.bytes.saturating_add(frame_bytes);
+        self.deltas.push_back(frame);
+        while self.deltas.len() + 1 > MAX_METADATA_HISTORY_FRAMES
+            || self.bytes > MAX_METADATA_HISTORY_BYTES
+        {
+            let Some(removed) = self.deltas.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(removed.queued_bytes());
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.baseline.is_none()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Frame> {
+        self.baseline.iter().chain(self.deltas.iter())
+    }
+}
 
 #[derive(Default)]
 pub struct WorldSnapshot {
@@ -43,10 +96,8 @@ pub struct WorldSnapshot {
     /// ordinary world entities.
     player_entity_id: Option<i32>,
     entities: HashMap<i32, EntityRecord>,
-    /// Latest server-encoded item for every metadata index. Preserving the
-    /// wire representation avoids changing serializer or registry ids when a
-    /// late viewer's state is reconstructed.
-    self_metadata: HashMap<u8, bytes::Bytes>,
+    /// Complete server packets, replayed without parsing nested serializers.
+    self_metadata: MetadataHistory,
     self_attributes: HashMap<
         azalea_registry::builtin::Attribute,
         azalea_protocol::packets::game::c_update_attributes::AttributeSnapshot,
@@ -174,10 +225,8 @@ struct EntityRecord {
     head_rot: i8,
     on_ground: bool,
     motion: Vec3,
-    /// Latest server-encoded item for every metadata index. Keeping complete
-    /// raw delta frames with a length ceiling either leaked memory or
-    /// eventually discarded fields that had not changed recently.
-    metadata: HashMap<u8, bytes::Bytes>,
+    /// Complete server packets, replayed without parsing nested serializers.
+    metadata: MetadataHistory,
     equipment: HashMap<azalea_inventory::components::EquipmentSlot, azalea_inventory::ItemStack>,
     attributes: HashMap<
         azalea_registry::builtin::Attribute,
@@ -483,7 +532,7 @@ impl WorldSnapshot {
                             head_rot: p.y_head_rot,
                             on_ground: false,
                             motion: p.movement.to_vec3(),
-                            metadata: HashMap::new(),
+                            metadata: MetadataHistory::default(),
                             equipment: HashMap::new(),
                             attributes: HashMap::new(),
                             effects: HashMap::new(),
@@ -569,15 +618,11 @@ impl WorldSnapshot {
                 }
             }
             ids::CB_GAME_SET_ENTITY_DATA => {
-                if let Some((entity_id, items)) = crate::reflect::encoded_metadata_items(f) {
+                if let Some(entity_id) = crate::reflect::metadata_entity_id(f) {
                     if self.player_entity_id == Some(entity_id) {
-                        for (index, item) in items {
-                            self.self_metadata.insert(index, item);
-                        }
+                        self.self_metadata.push(f.clone());
                     } else if let Some(e) = self.entities.get_mut(&entity_id) {
-                        for (index, item) in items {
-                            e.metadata.insert(index, item);
-                        }
+                        e.metadata.push(f.clone());
                     }
                 }
             }
@@ -1088,14 +1133,7 @@ impl WorldSnapshot {
                 entity_id: MinecraftEntityId(*id),
                 y_head_rot: e.head_rot,
             }));
-            if !e.metadata.is_empty() {
-                let mut metadata: Vec<_> = e.metadata.iter().collect();
-                metadata.sort_unstable_by_key(|(&index, _)| index);
-                q.push(crate::reflect::encoded_metadata_frame(
-                    *id,
-                    metadata.into_iter().map(|(_, item)| item.clone()),
-                ));
-            }
+            q.extend(e.metadata.iter().cloned());
             if !e.equipment.is_empty() {
                 q.push(frame_of(ClientboundSetEquipment {
                     entity_id: MinecraftEntityId(*id),
@@ -1249,12 +1287,11 @@ impl WorldSnapshot {
 
         let mut q = Vec::new();
         if !self.self_metadata.is_empty() {
-            let mut metadata: Vec<_> = self.self_metadata.iter().collect();
-            metadata.sort_unstable_by_key(|(&index, _)| index);
-            q.push(crate::reflect::encoded_metadata_frame(
-                entity_id,
-                metadata.into_iter().map(|(_, item)| item.clone()),
-            ));
+            if let Some(source_entity_id) = self.player_entity_id {
+                q.extend(self.self_metadata.iter().filter_map(|frame| {
+                    crate::reflect::retarget_metadata_frame(frame, source_entity_id, entity_id)
+                }));
+            }
         }
         if !self.self_attributes.is_empty() {
             let mut values: Vec<_> = self.self_attributes.values().cloned().collect();
@@ -1522,7 +1559,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_updates_merge_by_index() {
+    fn metadata_updates_replay_verbatim_in_original_order() {
         use azalea_core::entity_id::MinecraftEntityId;
         use azalea_entity::{EntityDataItem, EntityDataValue, EntityMetadataItems};
         use azalea_protocol::packets::game::c_set_entity_data::ClientboundSetEntityData;
@@ -1535,11 +1572,11 @@ mod tests {
                 packed_items: EntityMetadataItems(items),
             })
         };
-        snap.observe(&metadata(vec![EntityDataItem {
+        let first = metadata(vec![EntityDataItem {
             index: 0,
             value: EntityDataValue::Byte(1),
-        }]));
-        snap.observe(&metadata(vec![
+        }]);
+        let second = metadata(vec![
             EntityDataItem {
                 index: 0,
                 value: EntityDataValue::Byte(2),
@@ -1548,20 +1585,31 @@ mod tests {
                 index: 1,
                 value: EntityDataValue::Int(3),
             },
-        ]));
+        ]);
+        snap.observe(&first);
+        snap.observe(&second);
 
-        let packet = snap.replay().into_iter().find_map(|f| {
-            match ClientboundGamePacket::read(f.packet_id, &mut Cursor::new(&f.body[..])) {
-                Ok(ClientboundGamePacket::SetEntityData(p)) => Some(p),
-                _ => None,
-            }
-        });
-        let packet = packet.expect("metadata should be replayed");
-        assert_eq!(packet.packed_items.0.len(), 2);
-        assert!(packet.packed_items.0.contains(&EntityDataItem {
-            index: 0,
-            value: EntityDataValue::Byte(2),
-        }));
+        let replayed: Vec<_> = snap
+            .replay()
+            .into_iter()
+            .filter(|frame| frame.packet_id == ids::CB_GAME_SET_ENTITY_DATA)
+            .collect();
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[0].body, first.body);
+        assert_eq!(replayed[1].body, second.body);
+    }
+
+    #[test]
+    fn metadata_history_is_bounded_and_keeps_its_baseline() {
+        let mut history = MetadataHistory::default();
+        for value in 0..100u8 {
+            history.push(Frame::new(ids::CB_GAME_SET_ENTITY_DATA, vec![value; 1024]));
+        }
+
+        let frames: Vec<_> = history.iter().collect();
+        assert_eq!(frames.len(), MAX_METADATA_HISTORY_FRAMES);
+        assert_eq!(frames[0].body[0], 0);
+        assert!(history.bytes <= MAX_METADATA_HISTORY_BYTES);
     }
 
     #[test]

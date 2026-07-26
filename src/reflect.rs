@@ -401,73 +401,44 @@ pub fn reflected_using_item_frame(
     reflected_byte_metadata_frame(8, flags)
 }
 
-/// Build a metadata packet from already encoded items. Each item includes its
-/// index, serializer id, and value, but not the final `0xff` terminator.
-///
-/// Keeping items encoded is important: decoding and re-encoding metadata
-/// through a protocol library can change serializer ids or nested registry
-/// values even when that library can read its own output.
-pub(crate) fn encoded_metadata_frame(
-    entity_id: i32,
-    items: impl IntoIterator<Item = bytes::Bytes>,
-) -> Frame {
+/// Read only the leading entity id from a metadata packet. The remainder is
+/// deliberately opaque: nested 26.2 metadata codecs must not be decoded merely
+/// to cache or retarget a packet.
+pub(crate) fn metadata_entity_id(frame: &Frame) -> Option<i32> {
     use azalea_buf::AzBufVar;
-
-    let mut body = Vec::new();
-    entity_id
-        .azalea_write_var(&mut body)
-        .expect("writing a varint to memory cannot fail");
-    for item in items {
-        body.extend_from_slice(&item);
-    }
-    body.push(0xff);
-    Frame::new(ids::CB_GAME_SET_ENTITY_DATA, body)
-}
-
-/// Split a metadata packet into its exact wire-encoded items. Azalea is used
-/// only to find item boundaries; the bytes sent by the server are retained.
-pub(crate) fn encoded_metadata_items(frame: &Frame) -> Option<(i32, Vec<(u8, bytes::Bytes)>)> {
-    use azalea_buf::{AzBuf, AzBufVar};
-
     if frame.packet_id != ids::CB_GAME_SET_ENTITY_DATA {
         return None;
     }
-
     let mut cursor = Cursor::new(frame.body.as_ref());
-    let entity_id = i32::azalea_read_var(&mut cursor).ok()?;
-    let mut items = Vec::new();
-    loop {
-        let item_start = cursor.position() as usize;
-        let index = u8::azalea_read(&mut cursor).ok()?;
-        if index == 0xff {
-            return (cursor.position() as usize == frame.body.len()).then_some((entity_id, items));
-        }
-        azalea_entity::EntityDataValue::azalea_read(&mut cursor).ok()?;
-        let item_end = cursor.position() as usize;
-        // Copy only this item so a tiny cached value does not keep a complete,
-        // potentially much larger network frame allocation alive.
-        items.push((
-            index,
-            bytes::Bytes::copy_from_slice(&frame.body[item_start..item_end]),
-        ));
-    }
+    i32::azalea_read_var(&mut cursor).ok()
 }
 
 fn reflected_byte_metadata_frame(index: u8, value: u8) -> Frame {
+    use azalea_buf::AzBufVar;
+
     assert_ne!(index, 0xff, "0xff is the metadata terminator");
+    let mut body = Vec::with_capacity(9);
+    REFLECTED_ENTITY_ID
+        .azalea_write_var(&mut body)
+        .expect("writing a varint to memory cannot fail");
     // Serializer 0 is Byte in the 26.2 entity-data serializer registry.
-    encoded_metadata_frame(
-        REFLECTED_ENTITY_ID,
-        [bytes::Bytes::from(vec![index, 0, value])],
-    )
+    body.extend_from_slice(&[index, 0, value, 0xff]);
+    Frame::new(ids::CB_GAME_SET_ENTITY_DATA, body)
 }
 
 /// Replace only the entity id and keep the server's metadata payload
 /// byte-for-byte. This avoids protocol-library re-serialization entirely for
-/// the live reflection path.
-fn retarget_metadata_frame(frame: &Frame, source_entity_id: i32) -> Option<Frame> {
+/// both live reflection and snapshot replay.
+pub(crate) fn retarget_metadata_frame(
+    frame: &Frame,
+    source_entity_id: i32,
+    target_entity_id: i32,
+) -> Option<Frame> {
     use azalea_buf::AzBufVar;
 
+    if frame.packet_id != ids::CB_GAME_SET_ENTITY_DATA {
+        return None;
+    }
     let mut cursor = Cursor::new(frame.body.as_ref());
     if i32::azalea_read_var(&mut cursor).ok()? != source_entity_id {
         return None;
@@ -476,9 +447,12 @@ fn retarget_metadata_frame(frame: &Frame, source_entity_id: i32) -> Option<Frame
     if metadata_offset >= frame.body.len() {
         return None;
     }
+    if source_entity_id == target_entity_id {
+        return Some(frame.clone());
+    }
 
     let mut body = Vec::with_capacity(5 + frame.body.len() - metadata_offset);
-    REFLECTED_ENTITY_ID
+    target_entity_id
         .azalea_write_var(&mut body)
         .expect("writing a varint to memory cannot fail");
     body.extend_from_slice(&frame.body[metadata_offset..]);
@@ -506,7 +480,7 @@ pub fn retarget_self_visual(frame: &Frame, source_entity_id: i32) -> Option<Fram
     }
 
     if frame.packet_id == ids::CB_GAME_SET_ENTITY_DATA {
-        return retarget_metadata_frame(frame, source_entity_id);
+        return retarget_metadata_frame(frame, source_entity_id, REFLECTED_ENTITY_ID);
     }
 
     let target = MinecraftEntityId(REFLECTED_ENTITY_ID);
