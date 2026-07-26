@@ -43,7 +43,10 @@ pub struct WorldSnapshot {
     /// ordinary world entities.
     player_entity_id: Option<i32>,
     entities: HashMap<i32, EntityRecord>,
-    self_metadata: HashMap<u8, azalea_entity::EntityDataValue>,
+    /// Latest server-encoded item for every metadata index. Preserving the
+    /// wire representation avoids changing serializer or registry ids when a
+    /// late viewer's state is reconstructed.
+    self_metadata: HashMap<u8, bytes::Bytes>,
     self_attributes: HashMap<
         azalea_registry::builtin::Attribute,
         azalea_protocol::packets::game::c_update_attributes::AttributeSnapshot,
@@ -171,10 +174,10 @@ struct EntityRecord {
     head_rot: i8,
     on_ground: bool,
     motion: Vec3,
-    /// Latest value for every metadata index. Keeping raw delta frames with
-    /// a length ceiling either leaked memory or eventually discarded fields
-    /// that had not changed recently.
-    metadata: HashMap<u8, azalea_entity::EntityDataValue>,
+    /// Latest server-encoded item for every metadata index. Keeping complete
+    /// raw delta frames with a length ceiling either leaked memory or
+    /// eventually discarded fields that had not changed recently.
+    metadata: HashMap<u8, bytes::Bytes>,
     equipment: HashMap<azalea_inventory::components::EquipmentSlot, azalea_inventory::ItemStack>,
     attributes: HashMap<
         azalea_registry::builtin::Attribute,
@@ -566,14 +569,14 @@ impl WorldSnapshot {
                 }
             }
             ids::CB_GAME_SET_ENTITY_DATA => {
-                if let Some(ClientboundGamePacket::SetEntityData(p)) = typed(f) {
-                    if self.player_entity_id == Some(p.id.0) {
-                        for item in p.packed_items.0 {
-                            self.self_metadata.insert(item.index, item.value);
+                if let Some((entity_id, items)) = crate::reflect::encoded_metadata_items(f) {
+                    if self.player_entity_id == Some(entity_id) {
+                        for (index, item) in items {
+                            self.self_metadata.insert(index, item);
                         }
-                    } else if let Some(e) = self.entities.get_mut(&p.id.0) {
-                        for item in p.packed_items.0 {
-                            e.metadata.insert(item.index, item.value);
+                    } else if let Some(e) = self.entities.get_mut(&entity_id) {
+                        for (index, item) in items {
+                            e.metadata.insert(index, item);
                         }
                     }
                 }
@@ -1032,14 +1035,12 @@ impl WorldSnapshot {
     /// their accumulated positions, then vitals, inventory, scoreboards
     /// and ambience.
     pub fn replay(&self) -> Vec<Frame> {
-        use azalea_entity::{EntityDataItem, EntityMetadataItems};
         use azalea_protocol::common::movements::PositionMoveRotation;
         use azalea_protocol::packets::game::c_entity_position_sync::ClientboundEntityPositionSync;
         use azalea_protocol::packets::game::c_player_info_update::{
             ActionEnumSet, ClientboundPlayerInfoUpdate,
         };
         use azalea_protocol::packets::game::c_rotate_head::ClientboundRotateHead;
-        use azalea_protocol::packets::game::c_set_entity_data::ClientboundSetEntityData;
         use azalea_protocol::packets::game::c_set_equipment::{
             ClientboundSetEquipment, EquipmentSlots,
         };
@@ -1088,18 +1089,12 @@ impl WorldSnapshot {
                 y_head_rot: e.head_rot,
             }));
             if !e.metadata.is_empty() {
-                q.push(frame_of(ClientboundSetEntityData {
-                    id: MinecraftEntityId(*id),
-                    packed_items: EntityMetadataItems(
-                        e.metadata
-                            .iter()
-                            .map(|(&index, value)| EntityDataItem {
-                                index,
-                                value: value.clone(),
-                            })
-                            .collect(),
-                    ),
-                }));
+                let mut metadata: Vec<_> = e.metadata.iter().collect();
+                metadata.sort_unstable_by_key(|(&index, _)| index);
+                q.push(crate::reflect::encoded_metadata_frame(
+                    *id,
+                    metadata.into_iter().map(|(_, item)| item.clone()),
+                ));
             }
             if !e.equipment.is_empty() {
                 q.push(frame_of(ClientboundSetEquipment {
@@ -1250,26 +1245,16 @@ impl WorldSnapshot {
     }
 
     fn self_metadata_attribute_frames(&self, entity_id: i32) -> Vec<Frame> {
-        use azalea_entity::{EntityDataItem, EntityMetadataItems};
-        use azalea_protocol::packets::game::c_set_entity_data::ClientboundSetEntityData;
         use azalea_protocol::packets::game::c_update_attributes::ClientboundUpdateAttributes;
 
         let mut q = Vec::new();
         if !self.self_metadata.is_empty() {
             let mut metadata: Vec<_> = self.self_metadata.iter().collect();
             metadata.sort_unstable_by_key(|(&index, _)| index);
-            q.push(frame_of(ClientboundSetEntityData {
-                id: MinecraftEntityId(entity_id),
-                packed_items: EntityMetadataItems(
-                    metadata
-                        .into_iter()
-                        .map(|(&index, value)| EntityDataItem {
-                            index,
-                            value: value.clone(),
-                        })
-                        .collect(),
-                ),
-            }));
+            q.push(crate::reflect::encoded_metadata_frame(
+                entity_id,
+                metadata.into_iter().map(|(_, item)| item.clone()),
+            ));
         }
         if !self.self_attributes.is_empty() {
             let mut values: Vec<_> = self.self_attributes.values().cloned().collect();
