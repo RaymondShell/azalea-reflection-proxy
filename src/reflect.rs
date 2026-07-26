@@ -432,7 +432,7 @@ pub fn retarget_self_visual(frame: &Frame, source_entity_id: i32) -> Option<Fram
     }
 
     let target = MinecraftEntityId(REFLECTED_ENTITY_ID);
-    match ClientboundGamePacket::read(frame.packet_id, &mut Cursor::new(frame.body.as_slice()))
+    match ClientboundGamePacket::read(frame.packet_id, &mut Cursor::new(frame.body.as_ref()))
         .ok()?
     {
         ClientboundGamePacket::SetEntityData(mut packet)
@@ -672,7 +672,7 @@ mod tests {
         let retargeted = retarget_self_visual(&source, 42).expect("matching self packet");
         let packet = ClientboundGamePacket::read(
             retargeted.packet_id,
-            &mut Cursor::new(retargeted.body.as_slice()),
+            &mut Cursor::new(retargeted.body.as_ref()),
         )
         .unwrap();
         let ClientboundGamePacket::SetEntityData(packet) = packet else {

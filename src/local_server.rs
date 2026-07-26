@@ -16,12 +16,15 @@ use azalea_protocol::{
             c_status_response::{ClientboundStatusResponse, Players, Version},
             ServerboundStatusPacket,
         },
-        ClientIntention, PROTOCOL_VERSION,
+        ClientIntention, ProtocolPacket, PROTOCOL_VERSION,
     },
+    read::deserialize_packet,
 };
 use eyre::Result;
-use std::{io::Cursor, sync::Arc};
+use std::{fmt::Debug, io::Cursor, sync::Arc};
 use tokio::net::{TcpListener, TcpStream};
+
+use crate::relay::read_local_raw_packet;
 
 pub struct LocalServerConfig {
     pub bind: String, // e.g. "0.0.0.0:25566"
@@ -47,7 +50,7 @@ pub async fn accept_login(stream: TcpStream) -> Result<LocalClient> {
         Connection::wrap(stream);
 
     // 1. Read handshake
-    let packet = conn.read().await?;
+    let packet = read_local_packet(&mut conn).await?;
 
     let ServerboundHandshakePacket::Intention(intention) = packet;
 
@@ -57,7 +60,7 @@ pub async fn accept_login(stream: TcpStream) -> Result<LocalClient> {
             let mut conn = conn.status();
 
             // Wait for status request
-            let packet = conn.read().await?;
+            let packet = read_local_packet(&mut conn).await?;
             if let ServerboundStatusPacket::StatusRequest(_) = packet {
                 // Send status response with basic info
                 conn.write(ClientboundStatusResponse {
@@ -78,7 +81,7 @@ pub async fn accept_login(stream: TcpStream) -> Result<LocalClient> {
             }
 
             // Handle ping
-            let packet = conn.read().await?;
+            let packet = read_local_packet(&mut conn).await?;
             if let ServerboundStatusPacket::PingRequest(p) = packet {
                 conn.write(ClientboundPongResponse { time: p.time }).await?;
             }
@@ -100,7 +103,7 @@ pub async fn accept_login(stream: TcpStream) -> Result<LocalClient> {
             let mut conn = conn.login();
 
             // 2. Read Hello from client
-            let packet = conn.read().await?;
+            let packet = read_local_packet(&mut conn).await?;
             let (username, profile_id) = match packet {
                 ServerboundLoginPacket::Hello(p) => (p.name, p.profile_id),
                 _ => return Err(eyre::eyre!("Expected Hello packet, got {:?}", packet)),
@@ -119,7 +122,7 @@ pub async fn accept_login(stream: TcpStream) -> Result<LocalClient> {
             .await?;
 
             // 5. Wait for LoginAcknowledged
-            let packet = conn.read().await?;
+            let packet = read_local_packet(&mut conn).await?;
             match packet {
                 ServerboundLoginPacket::LoginAcknowledged(_) => {
                     tracing::debug!("Client acknowledged login");
@@ -138,6 +141,15 @@ pub async fn accept_login(stream: TcpStream) -> Result<LocalClient> {
         }
         ClientIntention::Transfer => Err(eyre::eyre!("Transfer intention not supported")),
     }
+}
+
+async fn read_local_packet<R, W>(conn: &mut Connection<R, W>) -> Result<R>
+where
+    R: ProtocolPacket + Debug,
+    W: ProtocolPacket,
+{
+    let raw = read_local_raw_packet(&mut conn.reader.raw).await?;
+    Ok(deserialize_packet(&mut Cursor::new(raw.as_ref()))?)
 }
 
 /// Encode the mc26.2 wire layout and let the selected Azalea packet type

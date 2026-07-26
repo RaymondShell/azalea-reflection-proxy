@@ -15,15 +15,19 @@ use std::time::Instant;
 
 use azalea_buf::AzBufVar;
 use azalea_core::entity_id::MinecraftEntityId;
+use azalea_core::math;
 use azalea_core::position::{BlockPos, Vec3};
 use azalea_entity::LookDirection;
 use azalea_inventory::{components::EquipmentSlot, ItemStack};
+use azalea_protocol::common::movements::{PositionMoveRotation, RelativeMovements};
 use azalea_protocol::packets::game::c_player_info_update::PlayerInfoEntry;
 use azalea_registry::builtin::ItemKind;
 use uuid::Uuid;
 
 use crate::ids::{self, frame_of};
 use crate::plugin::Frame;
+
+const MAX_CACHED_MAPS: usize = 256;
 
 #[derive(Default)]
 pub struct WorldSnapshot {
@@ -79,12 +83,13 @@ pub struct WorldSnapshot {
     /// makes the vanilla client dereference a null map entry and
     /// disconnect — we replay a synthesized Add for each on join.
     boss_bars: HashMap<Uuid, BossBar>,
-    passengers: HashMap<i32, Frame>,
+    passengers: HashMap<i32, Vec<MinecraftEntityId>>,
     entity_links: HashMap<i32, Frame>,
     chunk_biomes:
         HashMap<(i32, i32), azalea_protocol::packets::game::c_chunks_biomes::ChunkBiomeData>,
     light_updates: HashMap<(i32, i32), Frame>,
     maps: HashMap<u32, MapState>,
+    map_sequence: u64,
     cooldowns: HashMap<ItemKind, CooldownState>,
     border: Option<BorderState>,
     difficulty: Option<Frame>,
@@ -109,8 +114,8 @@ struct MapState {
     scale: u8,
     locked: bool,
     decorations: Option<Vec<azalea_protocol::packets::game::c_map_item_data::MapDecoration>>,
-    colors: Box<[u8; 128 * 128]>,
-    has_colors: bool,
+    colors: Option<Box<[u8; 128 * 128]>>,
+    last_update: u64,
 }
 
 struct BorderState {
@@ -165,7 +170,7 @@ struct EntityRecord {
     look: (i8, i8),
     head_rot: i8,
     on_ground: bool,
-    motion: azalea_core::delta::LpVec3,
+    motion: Vec3,
     /// Latest value for every metadata index. Keeping raw delta frames with
     /// a length ceiling either leaked memory or eventually discarded fields
     /// that had not changed recently.
@@ -230,6 +235,68 @@ fn compact_angle(deg: f32) -> i8 {
 
 fn degrees(compact: i8) -> f32 {
     compact as f32 * 360.0 / 256.0
+}
+
+fn apply_entity_teleport(
+    entity: &mut EntityRecord,
+    change: &PositionMoveRotation,
+    relative: &RelativeMovements,
+    on_ground: bool,
+) {
+    let old_y_rot = degrees(entity.look.0);
+    let old_x_rot = degrees(entity.look.1);
+    entity.pos = Vec3::new(
+        if relative.x {
+            entity.pos.x + change.pos.x
+        } else {
+            change.pos.x
+        },
+        if relative.y {
+            entity.pos.y + change.pos.y
+        } else {
+            change.pos.y
+        },
+        if relative.z {
+            entity.pos.z + change.pos.z
+        } else {
+            change.pos.z
+        },
+    );
+    let y_rot = if relative.y_rot {
+        old_y_rot + change.look_direction.y_rot()
+    } else {
+        change.look_direction.y_rot()
+    };
+    let x_rot = if relative.x_rot {
+        old_x_rot + change.look_direction.x_rot()
+    } else {
+        change.look_direction.x_rot()
+    };
+    let mut motion = entity.motion;
+    if relative.rotate_delta {
+        motion = motion
+            .x_rot(math::to_radians((old_x_rot - x_rot) as f64) as f32)
+            .y_rot(math::to_radians((old_y_rot - y_rot) as f64) as f32);
+    }
+    entity.motion = Vec3::new(
+        if relative.delta_x {
+            motion.x + change.delta.x
+        } else {
+            change.delta.x
+        },
+        if relative.delta_y {
+            motion.y + change.delta.y
+        } else {
+            change.delta.y
+        },
+        if relative.delta_z {
+            motion.z + change.delta.z
+        } else {
+            change.delta.z
+        },
+    );
+    entity.look = (compact_angle(y_rot), compact_angle(x_rot));
+    entity.on_ground = on_ground;
 }
 
 impl WorldSnapshot {
@@ -412,7 +479,7 @@ impl WorldSnapshot {
                             look: (p.y_rot, p.x_rot),
                             head_rot: p.y_head_rot,
                             on_ground: false,
-                            motion: p.movement,
+                            motion: p.movement.to_vec3(),
                             metadata: HashMap::new(),
                             equipment: HashMap::new(),
                             attributes: HashMap::new(),
@@ -426,6 +493,11 @@ impl WorldSnapshot {
                     for id in p.entity_ids {
                         self.entities.remove(&id.0);
                         self.passengers.remove(&id.0);
+                        for passengers in self.passengers.values_mut() {
+                            passengers.retain(|passenger| *passenger != id);
+                        }
+                        self.passengers
+                            .retain(|_, passengers| !passengers.is_empty());
                         self.entity_links.remove(&id.0);
                         self.entity_links.retain(|_, frame| {
                             if let Some(ClientboundGamePacket::SetEntityLink(link)) = typed(frame) {
@@ -474,6 +546,7 @@ impl WorldSnapshot {
                             compact_angle(p.values.look_direction.y_rot()),
                             compact_angle(p.values.look_direction.x_rot()),
                         );
+                        e.motion = p.values.delta;
                         e.on_ground = p.on_ground;
                     }
                 }
@@ -481,35 +554,7 @@ impl WorldSnapshot {
             ids::CB_GAME_TELEPORT_ENTITY => {
                 if let Some(ClientboundGamePacket::TeleportEntity(p)) = typed(f) {
                     if let Some(e) = self.entities.get_mut(&p.id.0) {
-                        e.pos = Vec3::new(
-                            if p.relative.x {
-                                e.pos.x + p.change.pos.x
-                            } else {
-                                p.change.pos.x
-                            },
-                            if p.relative.y {
-                                e.pos.y + p.change.pos.y
-                            } else {
-                                p.change.pos.y
-                            },
-                            if p.relative.z {
-                                e.pos.z + p.change.pos.z
-                            } else {
-                                p.change.pos.z
-                            },
-                        );
-                        let y_rot = if p.relative.y_rot {
-                            degrees(e.look.0) + p.change.look_direction.y_rot()
-                        } else {
-                            p.change.look_direction.y_rot()
-                        };
-                        let x_rot = if p.relative.x_rot {
-                            degrees(e.look.1) + p.change.look_direction.x_rot()
-                        } else {
-                            p.change.look_direction.x_rot()
-                        };
-                        e.look = (compact_angle(y_rot), compact_angle(x_rot));
-                        e.on_ground = p.on_ground;
+                        apply_entity_teleport(e, &p.change, &p.relative, p.on_ground);
                     }
                 }
             }
@@ -545,7 +590,7 @@ impl WorldSnapshot {
             ids::CB_GAME_SET_ENTITY_MOTION => {
                 if let Some(ClientboundGamePacket::SetEntityMotion(p)) = typed(f) {
                     if let Some(e) = self.entities.get_mut(&p.id.0) {
-                        e.motion = p.delta;
+                        e.motion = p.delta.to_vec3();
                     }
                 }
             }
@@ -734,7 +779,11 @@ impl WorldSnapshot {
             }
             ids::CB_GAME_SET_PASSENGERS => {
                 if let Some(ClientboundGamePacket::SetPassengers(p)) = typed(f) {
-                    self.passengers.insert(p.vehicle.0, f.clone());
+                    if p.passengers.is_empty() {
+                        self.passengers.remove(&p.vehicle.0);
+                    } else {
+                        self.passengers.insert(p.vehicle.0, p.passengers);
+                    }
                 }
             }
             ids::CB_GAME_SET_TIME => self.time = Some(f.clone()),
@@ -832,19 +881,23 @@ impl WorldSnapshot {
             }
             ids::CB_GAME_MAP_ITEM_DATA => {
                 if let Some(ClientboundGamePacket::MapItemData(p)) = typed(f) {
+                    self.map_sequence = self.map_sequence.wrapping_add(1);
+                    let update_sequence = self.map_sequence;
                     let state = self.maps.entry(p.map_id).or_insert_with(|| MapState {
                         scale: p.scale,
                         locked: p.locked,
                         decorations: None,
-                        colors: Box::new([0; 128 * 128]),
-                        has_colors: false,
+                        colors: None,
+                        last_update: update_sequence,
                     });
                     state.scale = p.scale;
                     state.locked = p.locked;
+                    state.last_update = update_sequence;
                     if let Some(decorations) = p.decorations {
                         state.decorations = Some(decorations);
                     }
                     if let Some(patch) = p.color_patch.0 {
+                        let colors = state.colors.get_or_insert_with(|| Box::new([0; 128 * 128]));
                         let width = usize::from(patch.width);
                         let height = usize::from(patch.height);
                         let start_x = usize::from(patch.start_x);
@@ -858,12 +911,12 @@ impl WorldSnapshot {
                                 let x = start_x + column;
                                 let y = start_y + row;
                                 if x < 128 && y < 128 {
-                                    state.colors[y * 128 + x] = color;
-                                    state.has_colors = true;
+                                    colors[y * 128 + x] = color;
                                 }
                             }
                         }
                     }
+                    self.trim_map_cache();
                 }
             }
             ids::CB_GAME_COOLDOWN => {
@@ -1025,7 +1078,7 @@ impl WorldSnapshot {
                 id: MinecraftEntityId(*id),
                 values: PositionMoveRotation {
                     pos: e.pos,
-                    delta: e.motion.to_vec3(),
+                    delta: e.motion,
                     look_direction: LookDirection::new(degrees(e.look.0), degrees(e.look.1)),
                 },
                 on_ground: e.on_ground,
@@ -1068,7 +1121,17 @@ impl WorldSnapshot {
             }
             q.extend(e.effects.values().cloned());
         }
-        q.extend(self.passengers.values().cloned());
+        let mut vehicles: Vec<_> = self.passengers.keys().copied().collect();
+        vehicles.sort_unstable();
+        q.extend(vehicles.into_iter().filter_map(|vehicle| {
+            let passengers = self.passengers.get(&vehicle)?;
+            Some(frame_of(
+                azalea_protocol::packets::game::c_set_passengers::ClientboundSetPassengers {
+                    vehicle: MinecraftEntityId(vehicle),
+                    passengers: passengers.clone(),
+                },
+            ))
+        }));
         q.extend(self.entity_links.values().cloned());
         q.extend(self.difficulty.iter().cloned());
         q.extend(self.game_rules.iter().cloned());
@@ -1258,16 +1321,30 @@ impl WorldSnapshot {
                     scale: map.scale,
                     locked: map.locked,
                     decorations: map.decorations.clone(),
-                    color_patch: OptionalMapPatch(map.has_colors.then(|| MapPatch {
+                    color_patch: OptionalMapPatch(map.colors.as_ref().map(|colors| MapPatch {
                         width: 128,
                         height: 128,
                         start_x: 0,
                         start_y: 0,
-                        map_colors: map.colors.to_vec(),
+                        map_colors: colors.to_vec(),
                     })),
                 }))
             })
             .collect()
+    }
+
+    fn trim_map_cache(&mut self) {
+        while self.maps.len() > MAX_CACHED_MAPS {
+            let Some(oldest) = self
+                .maps
+                .iter()
+                .min_by_key(|(_, state)| state.last_update)
+                .map(|(&map_id, _)| map_id)
+            else {
+                break;
+            };
+            self.maps.remove(&oldest);
+        }
     }
 
     fn cooldown_frames(&self) -> Vec<Frame> {
@@ -1654,7 +1731,7 @@ mod tests {
 
         let frame = snap.reflected_equipment_frame(99);
         let packet =
-            ClientboundGamePacket::read(frame.packet_id, &mut Cursor::new(frame.body.as_slice()))
+            ClientboundGamePacket::read(frame.packet_id, &mut Cursor::new(frame.body.as_ref()))
                 .unwrap();
         let ClientboundGamePacket::SetEquipment(packet) = packet else {
             panic!("expected SetEquipment");
@@ -1692,7 +1769,7 @@ mod tests {
             .filter_map(|frame| {
                 match ClientboundGamePacket::read(
                     frame.packet_id,
-                    &mut Cursor::new(frame.body.as_slice()),
+                    &mut Cursor::new(frame.body.as_ref()),
                 ) {
                     Ok(ClientboundGamePacket::SetPlayerInventory(packet)) if packet.slot == 0 => {
                         Some(packet.contents)
@@ -1726,7 +1803,7 @@ mod tests {
                 .find_map(|frame| {
                     match ClientboundGamePacket::read(
                         frame.packet_id,
-                        &mut Cursor::new(frame.body.as_slice()),
+                        &mut Cursor::new(frame.body.as_ref()),
                     ) {
                         Ok(ClientboundGamePacket::SetEntityData(packet)) => Some(packet),
                         _ => None,
@@ -1748,7 +1825,7 @@ mod tests {
             .find_map(|frame| {
                 match ClientboundGamePacket::read(
                     frame.packet_id,
-                    &mut Cursor::new(frame.body.as_slice()),
+                    &mut Cursor::new(frame.body.as_ref()),
                 ) {
                     Ok(ClientboundGamePacket::SetEntityData(packet)) => Some(packet),
                     _ => None,
@@ -1787,7 +1864,7 @@ mod tests {
         assert_eq!(replayed.len(), 1);
         let packet = ClientboundGamePacket::read(
             replayed[0].packet_id,
-            &mut Cursor::new(replayed[0].body.as_slice()),
+            &mut Cursor::new(replayed[0].body.as_ref()),
         )
         .unwrap();
         let ClientboundGamePacket::MapItemData(packet) = packet else {
@@ -1798,6 +1875,113 @@ mod tests {
         assert_eq!(patch.map_colors[3 * 128 + 4], 11);
         assert_eq!(patch.map_colors[3 * 128 + 5], 12);
         assert_eq!(patch.map_colors[3 * 128 + 6], 13);
+    }
+
+    #[test]
+    fn map_cache_evicts_the_oldest_entries() {
+        use azalea_protocol::packets::game::c_map_item_data::{
+            ClientboundMapItemData, OptionalMapPatch,
+        };
+
+        let mut snap = WorldSnapshot::default();
+        for map_id in 0..=MAX_CACHED_MAPS as u32 {
+            snap.observe(&frame_of(ClientboundMapItemData {
+                map_id,
+                scale: 0,
+                locked: false,
+                decorations: None,
+                color_patch: OptionalMapPatch(None),
+            }));
+        }
+
+        assert_eq!(snap.maps.len(), MAX_CACHED_MAPS);
+        assert!(!snap.maps.contains_key(&0));
+        assert!(snap.maps.contains_key(&(MAX_CACHED_MAPS as u32)));
+        assert!(snap.maps.values().all(|map| map.colors.is_none()));
+    }
+
+    #[test]
+    fn removed_entities_are_pruned_from_passenger_state() {
+        use azalea_protocol::packets::game::{
+            c_remove_entities::ClientboundRemoveEntities,
+            c_set_passengers::ClientboundSetPassengers,
+        };
+
+        let mut snap = WorldSnapshot::default();
+        snap.observe(&frame_of(ClientboundSetPassengers {
+            vehicle: MinecraftEntityId(10),
+            passengers: vec![MinecraftEntityId(20), MinecraftEntityId(30)],
+        }));
+        snap.observe(&frame_of(ClientboundRemoveEntities {
+            entity_ids: vec![MinecraftEntityId(20)],
+        }));
+        assert_eq!(snap.passengers.get(&10), Some(&vec![MinecraftEntityId(30)]));
+
+        snap.observe(&frame_of(ClientboundRemoveEntities {
+            entity_ids: vec![MinecraftEntityId(30)],
+        }));
+        assert!(!snap.passengers.contains_key(&10));
+    }
+
+    #[test]
+    fn entity_velocity_tracks_sync_and_relative_teleport_flags() {
+        use azalea_protocol::{
+            common::movements::{PositionMoveRotation, RelativeMovements},
+            packets::game::c_entity_position_sync::ClientboundEntityPositionSync,
+        };
+
+        let mut snap = WorldSnapshot::default();
+        snap.observe(&entity_frame(7, Uuid::from_u128(7)));
+        snap.observe(&frame_of(ClientboundEntityPositionSync {
+            id: MinecraftEntityId(7),
+            values: PositionMoveRotation {
+                pos: Vec3::new(1.0, 2.0, 3.0),
+                delta: Vec3::new(1.0, 0.0, 0.0),
+                look_direction: LookDirection::new(0.0, 0.0),
+            },
+            on_ground: true,
+        }));
+        assert_eq!(snap.entities[&7].motion, Vec3::new(1.0, 0.0, 0.0));
+
+        apply_entity_teleport(
+            snap.entities.get_mut(&7).unwrap(),
+            &PositionMoveRotation {
+                pos: Vec3::new(4.0, 5.0, 6.0),
+                delta: Vec3::new(0.5, 0.0, 0.0),
+                look_direction: LookDirection::new(0.0, 0.0),
+            },
+            &RelativeMovements {
+                delta_x: true,
+                ..RelativeMovements::default()
+            },
+            false,
+        );
+        assert_eq!(snap.entities[&7].motion, Vec3::new(1.5, 0.0, 0.0));
+
+        apply_entity_teleport(
+            snap.entities.get_mut(&7).unwrap(),
+            &PositionMoveRotation {
+                pos: Vec3::new(4.0, 5.0, 6.0),
+                delta: Vec3::new(0.25, 0.0, 0.0),
+                look_direction: LookDirection::new(90.0, 0.0),
+            },
+            &RelativeMovements {
+                delta_x: true,
+                rotate_delta: true,
+                ..RelativeMovements::default()
+            },
+            false,
+        );
+
+        let rotated = Vec3::new(1.5, 0.0, 0.0).y_rot(math::to_radians(-90.0) as f32);
+        let expected = Vec3::new(rotated.x + 0.25, 0.0, 0.0);
+        let actual = snap.entities[&7].motion;
+        assert!(
+            (actual.x - expected.x).abs() < 1.0e-6
+                && (actual.y - expected.y).abs() < 1.0e-6
+                && (actual.z - expected.z).abs() < 1.0e-6,
+            "actual {actual:?}, expected {expected:?}"
+        );
     }
 
     #[test]
@@ -1856,7 +2040,7 @@ mod tests {
             .filter_map(|frame| {
                 match ClientboundGamePacket::read(
                     frame.packet_id,
-                    &mut Cursor::new(frame.body.as_slice()),
+                    &mut Cursor::new(frame.body.as_ref()),
                 ) {
                     Ok(ClientboundGamePacket::SetObjective(_)) => Some("objective"),
                     Ok(ClientboundGamePacket::SetPlayerTeam(_)) => Some("team"),

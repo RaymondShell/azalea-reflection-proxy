@@ -111,7 +111,7 @@ where
     pkt.write(&mut body).expect("writing to a Vec cannot fail");
     Frame {
         packet_id: pkt.id(),
-        body,
+        body: body.into(),
     }
 }
 

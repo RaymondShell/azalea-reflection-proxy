@@ -23,11 +23,12 @@ at most once per account).
 
 ## Usage
 
-Add the crate to your bot:
+Until the compatible 26.2 dependency set is available on crates.io, use
+a local checkout of the crate:
 
 ```toml
 [dependencies]
-azalea-reflection-proxy = "0.1"
+azalea-reflection-proxy = { path = "../azalea-reflection-proxy" }
 ```
 
 Spawn the proxy in-process and point your azalea bot at it — two changed
@@ -55,8 +56,9 @@ The client must be Minecraft 26.2 (protocol 776), matching the pinned
 Azalea git revision. A compile-time assertion deliberately rejects older
 Azalea protocol revisions, including the current crates.io mc26.1 build.
 A standalone binary (`cargo run`, configured via `PROXY_EMAIL` /
-`PROXY_TARGET` / `PROXY_BIND` / `PROXY_AUTH_CACHE` env vars) wraps the
-same builder.
+`PROXY_TARGET` / `PROXY_BIND` / `PROXY_AUTH_CACHE`,
+`PROXY_MAX_CLIENTS`, and `PROXY_MAX_PENDING_HANDSHAKES` env vars) wraps
+the same builder.
 
 ### Commands (type in chat from any connected client)
 
@@ -86,7 +88,9 @@ same builder.
 
 - `.whitelist(["Name", ...])` — only these usernames may connect
   (case-insensitive); everyone else gets a disconnect message
-- `.max_clients(n)` — cap simultaneous clients
+- `.max_clients(n)` — cap simultaneous clients (default: 16)
+- `.max_pending_handshakes(n)` — cap local connections still completing
+  their handshake (default: 32)
 - `.always_first_control(true)` — original's `alwaysFirstControl`
 - `.plugin(Box::new(...))` — frame-level ProxyPlugin pipeline
 
@@ -120,10 +124,11 @@ tokio::spawn(async move {
   dimension), position, Game Event 13, the full raw chunk cache, and
   the world snapshot. Chunks are replayed nearest the current center
   first so terrain around the player becomes useful sooner. Large
-  replays use socket backpressure instead of a fixed frame-count queue;
-  live updates are buffered and caught up in order before the viewer
-  becomes live. Chunk replay is a hard requirement: the vanilla client
-  won't leave "Loading terrain..." until the chunk under its feet loads.
+  replays use byte-bounded socket backpressure with cancellation and
+  write timeouts; live updates are buffered with both frame and byte
+  ceilings and caught up in order before the viewer becomes live. Chunk
+  replay is a hard requirement: the vanilla client won't leave "Loading
+  terrain..." until the chunk under its feet loads.
 - World snapshot (`snapshot.rs`) — the snapshot.js port: changed blocks
   and block entities since each cached chunk, biome and light updates,
   entities (with positions accumulated from movement and latest velocity),
@@ -177,16 +182,25 @@ parses that one packet.
 
 ## Status
 
-Everything above is implemented. The passthrough and replicator paths
+Everything above is implemented. The crate is temporarily marked
+`publish = false`: Cargo strips git sources from a published manifest,
+but crates.io's Azalea 0.16 packages still speak Minecraft 26.1 while
+this proxy intentionally requires the pinned 26.2 revision. Re-enable
+publishing only after compatible Azalea packages are on crates.io and a
+clean `cargo publish --dry-run --locked` succeeds.
+
+The passthrough and replicator paths
 (bot through proxy, viewer join, terrain) and the viewer HUD have been
 tested live — hardening the mid-session join (modern inventory sync,
 boss-bar replay) came directly out of that testing. The richer
 scoreboard/map/world replay, persistent `,spectate` targets, and
 reflected equipment/actions have automated coverage but still need
-broader live-client mileage. Control handoff, the event stream, and
-whitelist/max_clients also have unit-test coverage but little live
-mileage yet. Treat `,acquire` with care on anticheat-guarded servers:
-position is aligned on handoff, but momentum is not carried over.
+broader live-client mileage. Control handoff now changes authority only
+after the replacement client's controller state has reached its socket
+writer; the event stream and connection limits still have less live
+mileage than the core passthrough path. Treat `,acquire` with care on
+anticheat-guarded servers: position is aligned on handoff, but momentum
+is not carried over.
 
 ## What is NOT ported (and why)
 

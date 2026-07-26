@@ -19,6 +19,8 @@ use azalea_protocol::{
 use eyre::Result;
 use tokio::net::lookup_host;
 
+const UPSTREAM_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Everything the relay needs about the established upstream leg.
 pub struct Upstream {
     pub connection: Connection<ClientboundConfigPacket, ServerboundConfigPacket>,
@@ -76,7 +78,13 @@ pub async fn connect(cfg: &UpstreamConfig) -> Result<Upstream> {
     let access_token = auth_result.access_token;
 
     // 2. Resolve and connect
-    let mut resolved = lookup_host((cfg.host.as_str(), cfg.port)).await?.peekable();
+    let mut resolved = tokio::time::timeout(
+        UPSTREAM_IO_TIMEOUT,
+        lookup_host((cfg.host.as_str(), cfg.port)),
+    )
+    .await
+    .map_err(|_| eyre::eyre!("DNS lookup timed out for {}:{}", cfg.host, cfg.port))??
+    .peekable();
     if resolved.peek().is_none() {
         eyre::bail!("Failed to resolve {}:{}", cfg.host, cfg.port);
     }
@@ -124,7 +132,9 @@ pub async fn connect(cfg: &UpstreamConfig) -> Result<Upstream> {
     .await?;
 
     // 5. Handle encryption
-    let packet = conn.read().await?;
+    let packet = tokio::time::timeout(UPSTREAM_IO_TIMEOUT, conn.read())
+        .await
+        .map_err(|_| eyre::eyre!("timed out waiting for upstream encryption request"))??;
     let encryption_request = match packet {
         ClientboundLoginPacket::Hello(p) => p,
         _ => return Err(eyre::eyre!("Expected encryption request, got {:?}", packet)),
@@ -162,7 +172,9 @@ pub async fn connect(cfg: &UpstreamConfig) -> Result<Upstream> {
     // 6. Handle compression
     let mut compression_threshold = None;
     loop {
-        let packet = conn.read().await?;
+        let packet = tokio::time::timeout(UPSTREAM_IO_TIMEOUT, conn.read())
+            .await
+            .map_err(|_| eyre::eyre!("timed out waiting for upstream login completion"))??;
         match packet {
             ClientboundLoginPacket::LoginCompression(p) => {
                 compression_threshold = Some(p.compression_threshold as u32);

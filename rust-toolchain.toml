@@ -3,4 +3,5 @@
 # cannot build this crate. rustup picks this up automatically for
 # local builds; CI installs the same channel explicitly.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-06-30"
+components = ["clippy", "rustfmt"]

@@ -16,11 +16,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use azalea_protocol::connect::Connection;
 use azalea_protocol::packets::config::{ClientboundConfigPacket, ServerboundConfigPacket};
 use eyre::Result;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use uuid::Uuid;
 
@@ -47,14 +49,27 @@ use crate::upstream::Upstream;
 pub type ClientId = u32;
 
 const MAX_REPLAY_PENDING_FRAMES: usize = 32_768;
+const MAX_REPLAY_PENDING_BYTES: usize = 64 * 1024 * 1024;
+const CLIENT_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+const UPSTREAM_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+const SESSION_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) enum SessionMsg {
-    FromUpstream(Frame),
+    FromUpstream {
+        frame: Frame,
+        _queued_bytes: OwnedSemaphorePermit,
+    },
     UpstreamClosed(String),
-    FromClient(ClientId, Frame),
+    FromClient {
+        id: ClientId,
+        frame: Frame,
+        _queued_bytes: OwnedSemaphorePermit,
+    },
     Attach {
         id: ClientId,
-        tx: mpsc::Sender<ClientOutput>,
+        queue: ClientQueue,
+        cancel: CancellationToken,
         username: String,
         uuid: Uuid,
     },
@@ -63,16 +78,245 @@ pub(crate) enum SessionMsg {
         id: ClientId,
         success: bool,
     },
+    PromotionFinished {
+        id: ClientId,
+        success: bool,
+    },
     /// Once-a-second timer: while controllerless, the stand-in must
     /// report the player's position like an idle client would.
     StandInTick,
 }
 
+#[derive(Clone)]
+pub(crate) struct SessionSender {
+    tx: mpsc::Sender<SessionMsg>,
+    frame_budget: Arc<Semaphore>,
+}
+
+impl SessionSender {
+    fn new(capacity: usize) -> (Self, mpsc::Receiver<SessionMsg>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            Self {
+                tx,
+                frame_budget: Arc::new(Semaphore::new(SESSION_QUEUE_BYTES)),
+            },
+            rx,
+        )
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
+    async fn send(&self, message: SessionMsg) -> Result<(), mpsc::error::SendError<SessionMsg>> {
+        self.tx.send(message).await
+    }
+
+    async fn send_upstream_frame(&self, frame: Frame) -> bool {
+        let Some(queued_bytes) = self.reserve_frame(&frame).await else {
+            return false;
+        };
+        self.tx
+            .send(SessionMsg::FromUpstream {
+                frame,
+                _queued_bytes: queued_bytes,
+            })
+            .await
+            .is_ok()
+    }
+
+    async fn send_client_frame(
+        &self,
+        id: ClientId,
+        frame: Frame,
+        cancel: &CancellationToken,
+    ) -> bool {
+        let Some(permits) = ClientQueue::byte_permits(&frame) else {
+            return false;
+        };
+        if permits as usize > SESSION_QUEUE_BYTES {
+            return false;
+        }
+        let acquire = self.frame_budget.clone().acquire_many_owned(permits);
+        let queued_bytes = tokio::select! {
+            _ = cancel.cancelled() => return false,
+            permit = acquire => match permit {
+                Ok(permit) => permit,
+                Err(_) => return false,
+            },
+        };
+        let message = SessionMsg::FromClient {
+            id,
+            frame,
+            _queued_bytes: queued_bytes,
+        };
+        tokio::select! {
+            _ = cancel.cancelled() => false,
+            result = self.tx.send(message) => result.is_ok(),
+        }
+    }
+
+    async fn reserve_frame(&self, frame: &Frame) -> Option<OwnedSemaphorePermit> {
+        let permits = ClientQueue::byte_permits(frame)?;
+        if permits as usize > SESSION_QUEUE_BYTES {
+            return None;
+        }
+        self.frame_budget
+            .clone()
+            .acquire_many_owned(permits)
+            .await
+            .ok()
+    }
+}
+
 pub(crate) enum ClientOutput {
-    Frame(Frame),
+    Frame {
+        frame: Frame,
+        /// Releases this frame's byte budget after the socket writer
+        /// finishes with it.
+        _queued_bytes: OwnedSemaphorePermit,
+    },
     /// A writer-side barrier. The acknowledgement is sent only after all
     /// preceding frames have been written to the socket.
     Flush(oneshot::Sender<()>),
+}
+
+#[derive(Clone)]
+pub(crate) struct ClientQueue {
+    tx: mpsc::Sender<ClientOutput>,
+    byte_budget: Arc<Semaphore>,
+}
+
+impl ClientQueue {
+    fn new(capacity: usize) -> (Self, mpsc::Receiver<ClientOutput>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            Self {
+                tx,
+                byte_budget: Arc::new(Semaphore::new(CLIENT_QUEUE_BYTES)),
+            },
+            rx,
+        )
+    }
+
+    fn byte_permits(frame: &Frame) -> Option<u32> {
+        u32::try_from(frame.queued_bytes()).ok()
+    }
+
+    fn try_send_frame(&self, frame: Frame) -> bool {
+        let Some(permits) = Self::byte_permits(&frame) else {
+            return false;
+        };
+        let Ok(queued_bytes) = self.byte_budget.clone().try_acquire_many_owned(permits) else {
+            return false;
+        };
+        self.tx
+            .try_send(ClientOutput::Frame {
+                frame,
+                _queued_bytes: queued_bytes,
+            })
+            .is_ok()
+    }
+
+    async fn send_frame(&self, frame: Frame, cancel: &CancellationToken) -> bool {
+        let Some(permits) = Self::byte_permits(&frame) else {
+            return false;
+        };
+        if permits as usize > CLIENT_QUEUE_BYTES {
+            return false;
+        }
+        let acquire = self.byte_budget.clone().acquire_many_owned(permits);
+        let queued_bytes = tokio::select! {
+            _ = cancel.cancelled() => return false,
+            result = tokio::time::timeout(IO_TIMEOUT, acquire) => {
+                match result {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) | Err(_) => return false,
+                }
+            }
+        };
+        let output = ClientOutput::Frame {
+            frame,
+            _queued_bytes: queued_bytes,
+        };
+        tokio::select! {
+            _ = cancel.cancelled() => false,
+            result = tokio::time::timeout(IO_TIMEOUT, self.tx.send(output)) => {
+                matches!(result, Ok(Ok(())))
+            }
+        }
+    }
+
+    fn try_send_flush(&self, done: oneshot::Sender<()>) -> bool {
+        self.tx.try_send(ClientOutput::Flush(done)).is_ok()
+    }
+
+    async fn flush(&self, cancel: &CancellationToken) -> bool {
+        let (done_tx, done_rx) = oneshot::channel();
+        let sent = tokio::select! {
+            _ = cancel.cancelled() => false,
+            result = tokio::time::timeout(
+                IO_TIMEOUT,
+                self.tx.send(ClientOutput::Flush(done_tx)),
+            ) => matches!(result, Ok(Ok(()))),
+        };
+        if !sent {
+            return false;
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => false,
+            result = tokio::time::timeout(IO_TIMEOUT, done_rx) => {
+                matches!(result, Ok(Ok(())))
+            }
+        }
+    }
+}
+
+struct QueuedFrame {
+    frame: Frame,
+    _queued_bytes: OwnedSemaphorePermit,
+}
+
+#[derive(Clone)]
+struct UpstreamQueue {
+    tx: mpsc::Sender<QueuedFrame>,
+    byte_budget: Arc<Semaphore>,
+}
+
+impl UpstreamQueue {
+    fn new(capacity: usize) -> (Self, mpsc::Receiver<QueuedFrame>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            Self {
+                tx,
+                byte_budget: Arc::new(Semaphore::new(UPSTREAM_QUEUE_BYTES)),
+            },
+            rx,
+        )
+    }
+
+    async fn send(&self, frame: Frame) -> bool {
+        let Some(permits) = ClientQueue::byte_permits(&frame) else {
+            return false;
+        };
+        if permits as usize > UPSTREAM_QUEUE_BYTES {
+            return false;
+        }
+        let acquire = self.byte_budget.clone().acquire_many_owned(permits);
+        let queued_bytes = match tokio::time::timeout(IO_TIMEOUT, acquire).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) | Err(_) => return false,
+        };
+        let queued = QueuedFrame {
+            frame,
+            _queued_bytes: queued_bytes,
+        };
+        matches!(
+            tokio::time::timeout(IO_TIMEOUT, self.tx.send(queued)).await,
+            Ok(Ok(()))
+        )
+    }
 }
 
 enum ClientState {
@@ -85,13 +329,20 @@ enum ClientState {
     /// A potentially large game-state replay is being written with
     /// backpressure. Live frames arriving meanwhile are retained here
     /// and sent in a subsequent ordered catch-up batch.
-    Replaying { pending: Vec<Frame> },
+    Replaying {
+        pending: Vec<Frame>,
+        pending_bytes: usize,
+    },
+    /// Controller kit and handoff teleport have been queued. The old
+    /// controller remains authoritative until the writer flushes them.
+    Promoting,
     /// Receiving live broadcast.
     Live,
 }
 
 struct ClientHandle {
-    tx: mpsc::Sender<ClientOutput>,
+    queue: ClientQueue,
+    cancel: CancellationToken,
     state: ClientState,
     username: String,
     uuid: Uuid,
@@ -183,14 +434,17 @@ enum UpstreamState {
 }
 
 struct Session {
-    message_tx: mpsc::Sender<SessionMsg>,
+    message_tx: SessionSender,
     pipeline: Arc<Pipeline>,
-    upstream_tx: mpsc::Sender<Frame>,
+    upstream_tx: UpstreamQueue,
     clients: HashMap<ClientId, ClientHandle>,
     /// Whoever's serverbound traffic reaches the server. None = nobody:
     /// the proxy answers keepalives/teleports itself and the session
     /// player stands AFK.
     controller: Option<ClientId>,
+    /// Candidate whose controller kit is currently flushing. Its
+    /// serverbound gameplay remains swallowed until promotion completes.
+    pending_controller: Option<ClientId>,
     cache: JoinCache,
     upstream_state: UpstreamState,
     seen_first_game_frame: bool,
@@ -238,7 +492,7 @@ pub fn spawn(
     pipeline: Arc<Pipeline>,
     opts: SessionOpts,
     events: broadcast::Sender<ProxyEvent>,
-) -> mpsc::Sender<SessionMsg> {
+) -> SessionSender {
     tracing::info!(
         "session start: controller '{}', upstream compression threshold {:?}",
         controller.username,
@@ -251,19 +505,21 @@ pub fn spawn(
         p.on_session_start();
     }
 
-    let (msg_tx, msg_rx) = mpsc::channel::<SessionMsg>(1024);
+    let (msg_tx, msg_rx) = SessionSender::new(1024);
     let upstream_tx = start_upstream_io(upstream, msg_tx.clone());
 
     // Generous buffer: the controller is never sent frames with a
     // blocking await (that would let a slow bot stall the whole actor),
     // so this bound is a memory ceiling / "hopelessly behind" tripwire,
     // sized to absorb a full render-distance warp burst.
-    let (ctl_tx, ctl_rx) = mpsc::channel::<ClientOutput>(16384);
+    let (ctl_queue, ctl_rx) = ClientQueue::new(16384);
+    let ctl_cancel = CancellationToken::new();
     let mut clients = HashMap::new();
     clients.insert(
         controller_id,
         ClientHandle {
-            tx: ctl_tx,
+            queue: ctl_queue,
+            cancel: ctl_cancel.clone(),
             state: ClientState::Live,
             username: controller.username.clone(),
             uuid: controller.uuid,
@@ -271,7 +527,13 @@ pub fn spawn(
             camera_target: None,
         },
     );
-    start_client_io(controller_id, controller.connection, msg_tx.clone(), ctl_rx);
+    start_client_io(
+        controller_id,
+        controller.connection,
+        msg_tx.clone(),
+        ctl_rx,
+        ctl_cancel,
+    );
 
     let _ = events.send(ProxyEvent::SessionStarted);
     let _ = events.send(ProxyEvent::ClientJoined {
@@ -289,6 +551,7 @@ pub fn spawn(
         upstream_tx,
         clients,
         controller: Some(controller_id),
+        pending_controller: None,
         cache,
         upstream_state: UpstreamState::Config,
         seen_first_game_frame: false,
@@ -326,24 +589,26 @@ pub fn spawn(
 /// viewer. The Attach message is sent before the reader task spawns so
 /// the session never sees a FromClient for an unknown id.
 pub async fn attach_viewer(
-    session_tx: &mpsc::Sender<SessionMsg>,
+    session_tx: &SessionSender,
     id: ClientId,
     client: LocalClient,
 ) -> Result<()> {
     // Live traffic remains bounded. Large join replays use async
     // backpressure and therefore no longer depend on fitting in this
     // channel all at once.
-    let (tx, rx) = mpsc::channel::<ClientOutput>(8192);
+    let (queue, rx) = ClientQueue::new(8192);
+    let cancel = CancellationToken::new();
     session_tx
         .send(SessionMsg::Attach {
             id,
-            tx,
+            queue,
+            cancel: cancel.clone(),
             username: client.username.clone(),
             uuid: client.uuid,
         })
         .await
         .map_err(|_| eyre::eyre!("session closed while attaching"))?;
-    start_client_io(id, client.connection, session_tx.clone(), rx);
+    start_client_io(id, client.connection, session_tx.clone(), rx, cancel);
     Ok(())
 }
 
@@ -372,20 +637,30 @@ fn respawn_data_to_keep(f: &Frame) -> u8 {
     }
 }
 
-fn start_upstream_io(upstream: Upstream, msg_tx: mpsc::Sender<SessionMsg>) -> mpsc::Sender<Frame> {
+fn start_upstream_io(upstream: Upstream, msg_tx: SessionSender) -> UpstreamQueue {
     let (read, write) = upstream.connection.into_split_raw();
-    let (tx, mut rx) = mpsc::channel::<Frame>(1024);
+    let (queue, mut rx) = UpstreamQueue::new(1024);
 
     let writer_msg_tx = msg_tx.clone();
     tokio::spawn(async move {
         let mut sink = AzaleaFrameSink { writer: write };
-        while let Some(f) = rx.recv().await {
-            if let Err(e) = sink.write_frame(f).await {
-                tracing::warn!("upstream write failed: {e:#}");
-                let _ = writer_msg_tx
-                    .send(SessionMsg::UpstreamClosed(format!("write failed: {e:#}")))
-                    .await;
-                break;
+        while let Some(queued) = rx.recv().await {
+            match tokio::time::timeout(IO_TIMEOUT, sink.write_frame(queued.frame)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!("upstream write failed: {e:#}");
+                    let _ = writer_msg_tx
+                        .send(SessionMsg::UpstreamClosed(format!("write failed: {e:#}")))
+                        .await;
+                    break;
+                }
+                Err(_) => {
+                    tracing::warn!("upstream write timed out");
+                    let _ = writer_msg_tx
+                        .send(SessionMsg::UpstreamClosed("write timed out".to_string()))
+                        .await;
+                    break;
+                }
             }
         }
     });
@@ -395,7 +670,7 @@ fn start_upstream_io(upstream: Upstream, msg_tx: mpsc::Sender<SessionMsg>) -> mp
         loop {
             match src.read_frame().await {
                 Ok(f) => {
-                    if msg_tx.send(SessionMsg::FromUpstream(f)).await.is_err() {
+                    if !msg_tx.send_upstream_frame(f).await {
                         break;
                     }
                 }
@@ -409,27 +684,49 @@ fn start_upstream_io(upstream: Upstream, msg_tx: mpsc::Sender<SessionMsg>) -> mp
         }
     });
 
-    tx
+    queue
 }
 
 fn start_client_io(
     id: ClientId,
     conn: Connection<ServerboundConfigPacket, ClientboundConfigPacket>,
-    msg_tx: mpsc::Sender<SessionMsg>,
+    msg_tx: SessionSender,
     mut frame_rx: mpsc::Receiver<ClientOutput>,
+    cancel: CancellationToken,
 ) {
     let (read, write) = conn.into_split_raw();
 
     let writer_msg_tx = msg_tx.clone();
+    let writer_cancel = cancel.clone();
     tokio::spawn(async move {
         let mut sink = AzaleaFrameSink { writer: write };
         while let Some(output) = frame_rx.recv().await {
             match output {
-                ClientOutput::Frame(frame) => {
-                    if let Err(e) = sink.write_frame(frame).await {
-                        tracing::debug!("client {id} write failed: {e:#}");
-                        let _ = writer_msg_tx.send(SessionMsg::Detach(id)).await;
-                        break;
+                ClientOutput::Frame {
+                    frame,
+                    _queued_bytes,
+                } => {
+                    let write = tokio::select! {
+                        _ = writer_cancel.cancelled() => break,
+                        result = tokio::time::timeout(
+                            IO_TIMEOUT,
+                            sink.write_frame(frame),
+                        ) => result,
+                    };
+                    match write {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            tracing::debug!("client {id} write failed: {e:#}");
+                            let _ = writer_msg_tx.send(SessionMsg::Detach(id)).await;
+                            writer_cancel.cancel();
+                            break;
+                        }
+                        Err(_) => {
+                            tracing::debug!("client {id} write timed out");
+                            let _ = writer_msg_tx.send(SessionMsg::Detach(id)).await;
+                            writer_cancel.cancel();
+                            break;
+                        }
                     }
                 }
                 ClientOutput::Flush(done) => {
@@ -437,20 +734,27 @@ fn start_client_io(
                 }
             }
         }
+        writer_cancel.cancel();
     });
 
+    let reader_cancel = cancel.clone();
     tokio::spawn(async move {
         let mut src = AzaleaFrameSource { reader: read };
         loop {
-            match src.read_frame().await {
+            let read = tokio::select! {
+                _ = reader_cancel.cancelled() => break,
+                result = src.read_local_frame() => result,
+            };
+            match read {
                 Ok(f) => {
-                    if msg_tx.send(SessionMsg::FromClient(id, f)).await.is_err() {
+                    if !msg_tx.send_client_frame(id, f, &reader_cancel).await {
                         break;
                     }
                 }
                 Err(e) => {
                     tracing::debug!("client {id} read ended: {e:#}");
                     let _ = msg_tx.send(SessionMsg::Detach(id)).await;
+                    reader_cancel.cancel();
                     break;
                 }
             }
@@ -461,21 +765,21 @@ fn start_client_io(
 fn spawn_client_batch(
     id: ClientId,
     frames: Vec<Frame>,
-    tx: mpsc::Sender<ClientOutput>,
-    message_tx: mpsc::Sender<SessionMsg>,
+    queue: ClientQueue,
+    cancel: CancellationToken,
+    message_tx: SessionSender,
 ) {
     tokio::spawn(async move {
         let mut success = true;
         for frame in frames {
-            if tx.send(ClientOutput::Frame(frame)).await.is_err() {
+            if !queue.send_frame(frame, &cancel).await {
                 success = false;
                 break;
             }
         }
 
         if success {
-            let (done_tx, done_rx) = oneshot::channel();
-            success = tx.send(ClientOutput::Flush(done_tx)).await.is_ok() && done_rx.await.is_ok();
+            success = queue.flush(&cancel).await;
         }
 
         let _ = message_tx
@@ -485,15 +789,24 @@ fn spawn_client_batch(
 }
 
 impl Session {
+    async fn send_upstream(&self, frame: Frame, context: &str) -> bool {
+        if self.upstream_tx.send(frame).await {
+            true
+        } else {
+            tracing::warn!("{context} failed: upstream queue closed or timed out");
+            false
+        }
+    }
+
     async fn run(mut self, mut rx: mpsc::Receiver<SessionMsg>) {
         while let Some(msg) = rx.recv().await {
             match msg {
-                SessionMsg::FromUpstream(frame) => self.on_upstream_frame(frame).await,
+                SessionMsg::FromUpstream { frame, .. } => self.on_upstream_frame(frame).await,
                 SessionMsg::UpstreamClosed(reason) => {
                     tracing::info!("upstream closed: {reason}");
                     break;
                 }
-                SessionMsg::FromClient(id, frame) => {
+                SessionMsg::FromClient { id, frame, .. } => {
                     if let Err(e) = self.on_client_frame(id, frame).await {
                         tracing::info!("session ending: {e:#}");
                         break;
@@ -501,13 +814,17 @@ impl Session {
                 }
                 SessionMsg::Attach {
                     id,
-                    tx,
+                    queue,
+                    cancel,
                     username,
                     uuid,
-                } => self.on_attach(id, tx, username, uuid),
+                } => self.on_attach(id, queue, cancel, username, uuid),
                 SessionMsg::Detach(id) => self.drop_client(id, "disconnected"),
                 SessionMsg::ReplayBatchFinished { id, success } => {
                     self.on_replay_batch_finished(id, success)
+                }
+                SessionMsg::PromotionFinished { id, success } => {
+                    self.on_promotion_finished(id, success)
                 }
                 SessionMsg::StandInTick => self.stand_in_tick().await,
             }
@@ -592,9 +909,7 @@ impl Session {
             _ => None,
         };
         if let Some(r) = keepalive {
-            if self.upstream_tx.send(r).await.is_err() {
-                tracing::warn!("keepalive reply failed: upstream writer closed");
-            }
+            self.send_upstream(r, "keepalive reply").await;
             return;
         }
 
@@ -604,9 +919,7 @@ impl Session {
             && f.packet_id == ids::CB_GAME_PLAYER_POSITION
         {
             if let Some(r) = reflect::teleport_id(f).map(reflect::accept_teleport_frame) {
-                if self.upstream_tx.send(r).await.is_err() {
-                    tracing::warn!("stand-in teleport-accept failed: upstream writer closed");
-                }
+                self.send_upstream(r, "stand-in teleport-accept").await;
             }
         }
     }
@@ -634,9 +947,7 @@ impl Session {
         let Some(f) = reflect::idle_move_frame(&self.pose) else {
             return; // pose unknown until the first teleport lands
         };
-        if self.upstream_tx.send(f).await.is_err() {
-            tracing::warn!("stand-in heartbeat failed: upstream writer closed");
-        }
+        self.send_upstream(f, "stand-in heartbeat").await;
     }
 
     /// Track upstream protocol state and maintain the join cache. Runs on
@@ -749,8 +1060,7 @@ impl Session {
         use std::io::Cursor;
 
         let parsed = || {
-            ServerboundGamePacket::read(frame.packet_id, &mut Cursor::new(frame.body.as_slice()))
-                .ok()
+            ServerboundGamePacket::read(frame.packet_id, &mut Cursor::new(frame.body.as_ref())).ok()
         };
 
         match frame.packet_id {
@@ -847,8 +1157,12 @@ impl Session {
     }
 
     async fn on_client_frame(&mut self, id: ClientId, frame: Frame) -> Result<()> {
+        let client_is_in_game = matches!(
+            self.clients.get(&id).map(|client| &client.state),
+            Some(ClientState::Replaying { .. } | ClientState::Promoting | ClientState::Live)
+        );
         // chat commands, from controller and viewers alike
-        if matches!(self.upstream_state, UpstreamState::Game) {
+        if matches!(self.upstream_state, UpstreamState::Game) && client_is_in_game {
             if let Some(text) = reflect::chat_text(&frame) {
                 if text.starts_with(',') {
                     self.handle_command(id, text.trim()).await?;
@@ -858,7 +1172,12 @@ impl Session {
         }
 
         if Some(id) == self.controller {
-            let (forward, reflected_updates) = self.mirror_controller_state(&frame);
+            let (forward, reflected_updates) = if matches!(self.upstream_state, UpstreamState::Game)
+            {
+                self.mirror_controller_state(&frame)
+            } else {
+                (true, Vec::new())
+            };
             if !forward {
                 self.feedback(id, "invalid hotbar slot was blocked");
                 return Ok(());
@@ -915,7 +1234,7 @@ impl Session {
             // movement, accumulates into an "out of sync" Limbo. Viewers can
             // tolerate the frame of latency; the server cannot.
             for f in self.pipeline.serverbound(frame) {
-                if self.upstream_tx.send(f).await.is_err() {
+                if !self.send_upstream(f, "controller frame").await {
                     eyre::bail!("upstream writer closed");
                 }
             }
@@ -938,7 +1257,10 @@ impl Session {
         // A viewer can scroll its local hotbar even though its gameplay
         // packets are swallowed. Immediately restore the controller's
         // authoritative slot so the HUD cannot drift.
-        if frame.packet_id == ids::SB_GAME_SET_CARRIED_ITEM {
+        if matches!(self.upstream_state, UpstreamState::Game)
+            && client_is_in_game
+            && frame.packet_id == ids::SB_GAME_SET_CARRIED_ITEM
+        {
             let held = self.cache.world.selected_hotbar_frame();
             self.queue_frames(
                 id,
@@ -970,6 +1292,7 @@ impl Session {
             let c = self.clients.get_mut(&id).expect("checked above");
             c.state = ClientState::Replaying {
                 pending: Vec::new(),
+                pending_bytes: 0,
             };
             tracing::info!(
                 "viewer {id} ('{}') game replay started ({frame_count} frames)",
@@ -985,6 +1308,13 @@ impl Session {
     /// gamemode).
     async fn handle_command(&mut self, id: ClientId, cmd: &str) -> Result<()> {
         tracing::info!("client {id} issued command: {cmd}");
+        if !matches!(
+            self.clients.get(&id).map(|client| &client.state),
+            Some(ClientState::Live)
+        ) {
+            self.feedback(id, "still synchronizing; try the command again shortly");
+            return Ok(());
+        }
         let (verb, arg) = match cmd.split_once(' ') {
             Some((v, a)) => (v, a.trim()),
             None => (cmd, ""),
@@ -995,17 +1325,20 @@ impl Session {
                     self.feedback(id, "you already have control");
                     return Ok(());
                 }
-                // demote whoever had it
-                if let Some(old) = self.controller.take() {
-                    self.demote_to_spectator(old);
-                    self.feedback(old, "your control was taken by another client");
+                if self.pending_controller.is_some() {
+                    self.feedback(id, "another control handoff is already in progress");
+                    return Ok(());
                 }
-                if self.promote_to_controller(id) {
-                    self.feedback(id, "you have control now");
+                if self.begin_promotion(id) {
+                    self.feedback(id, "preparing control handoff");
                 }
             }
             ",release" => {
                 if Some(id) == self.controller {
+                    if self.pending_controller.is_some() {
+                        self.feedback(id, "control handoff is already in progress");
+                        return Ok(());
+                    }
                     self.controller = None;
                     self.demote_to_spectator(id);
                     if self.opts.always_first_control {
@@ -1013,7 +1346,7 @@ impl Session {
                             self.feedback(id, "control released to the oldest viewer");
                             self.feedback(
                                 next,
-                                "another client released control — you have control now",
+                                "another client released control — preparing handoff",
                             );
                         } else {
                             self.feedback(
@@ -1282,13 +1615,18 @@ impl Session {
         }
     }
 
-    /// Turn a viewer into the controller: real game mode + abilities
-    /// back, ghost entity gone, client teleported onto the bot so its
-    /// movement continues from the right place (GrimAC-style alignment).
-    fn promote_to_controller(&mut self, id: ClientId) -> bool {
+    /// Queue the controller kit and switch authority only after the
+    /// client's socket writer confirms the complete handoff was written.
+    fn begin_promotion(&mut self, id: ClientId) -> bool {
+        if self.pending_controller.is_some() {
+            return false;
+        }
         let Some(c) = self.clients.get(&id) else {
             return false;
         };
+        if !matches!(&c.state, ClientState::Live) {
+            return false;
+        }
         let uuid = c.uuid;
         let username = c.username.clone();
         let mut frames = reflect::controller_kit(uuid, &username, self.real_game_mode);
@@ -1302,15 +1640,76 @@ impl Session {
         if !self.queue_frames(id, frames, "queue overflow while acquiring control") {
             return false;
         }
-        if let Some(c) = self.clients.get_mut(&id) {
+        let (done_tx, done_rx) = oneshot::channel();
+        let flush_queued = self
+            .clients
+            .get(&id)
+            .is_some_and(|c| c.queue.try_send_flush(done_tx));
+        if !flush_queued {
+            self.drop_client(id, "queue overflow while flushing control handoff");
+            return false;
+        }
+        let (cancel, message_tx) = {
+            let Some(c) = self.clients.get_mut(&id) else {
+                return false;
+            };
+            c.state = ClientState::Promoting;
             c.swallow_next_accept = has_teleport;
-            c.camera_target = None; // controller drives its own camera
+            c.camera_target = None;
+            (c.cancel.clone(), self.message_tx.clone())
+        };
+        self.pending_controller = Some(id);
+        tokio::spawn(async move {
+            let success = tokio::select! {
+                _ = cancel.cancelled() => false,
+                result = tokio::time::timeout(IO_TIMEOUT, done_rx) => {
+                    matches!(result, Ok(Ok(())))
+                }
+            };
+            let _ = message_tx
+                .send(SessionMsg::PromotionFinished { id, success })
+                .await;
+        });
+        tracing::info!("client {id} ('{username}') control handoff is flushing");
+        true
+    }
+
+    fn on_promotion_finished(&mut self, id: ClientId, success: bool) {
+        if self.pending_controller != Some(id) {
+            return;
+        }
+        if !success {
+            self.pending_controller = None;
+            self.drop_client(id, "control handoff did not flush");
+            if self.controller.is_none() && self.opts.always_first_control {
+                self.promote_oldest_live(None);
+            }
+            return;
+        }
+
+        let username = {
+            let Some(c) = self.clients.get_mut(&id) else {
+                self.pending_controller = None;
+                return;
+            };
+            if !matches!(&c.state, ClientState::Promoting) {
+                self.pending_controller = None;
+                return;
+            }
+            c.state = ClientState::Live;
+            c.username.clone()
+        };
+        let previous = self.controller.take().filter(|&old| old != id);
+        self.pending_controller = None;
+        if let Some(old) = previous {
+            self.demote_to_spectator(old);
+            self.feedback(old, "your control was taken by another client");
         }
         self.controller = Some(id);
         let _ = self.events.send(ProxyEvent::ControlChanged {
             controller: Some((id, username)),
         });
-        true
+        self.feedback(id, "you have control now");
     }
 
     /// Re-send the viewer kit to every Live viewer after a Login /
@@ -1323,6 +1722,7 @@ impl Session {
             .iter()
             .filter(|(&cid, c)| {
                 Some(cid) != self.controller
+                    && Some(cid) != self.pending_controller
                     && matches!(&c.state, ClientState::Live | ClientState::Replaying { .. })
             })
             .map(|(&cid, c)| (cid, c.uuid, c.username.clone()))
@@ -1337,7 +1737,8 @@ impl Session {
     fn on_attach(
         &mut self,
         id: ClientId,
-        tx: mpsc::Sender<ClientOutput>,
+        queue: ClientQueue,
+        cancel: CancellationToken,
         username: String,
         uuid: Uuid,
     ) {
@@ -1346,10 +1747,10 @@ impl Session {
                 tracing::info!("refusing viewer {id} ('{username}'): max_clients={max} reached");
                 use azalea_chat::FormattedText;
                 use azalea_protocol::packets::config::c_disconnect::ClientboundDisconnect;
-                let _ = tx.try_send(ClientOutput::Frame(ids::frame_of(ClientboundDisconnect {
+                let _ = queue.try_send_frame(ids::frame_of(ClientboundDisconnect {
                     reason: FormattedText::from("this proxy has reached its client limit"),
-                })));
-                // Dropping tx after the queued disconnect closes the writer
+                }));
+                // Dropping queue after the queued disconnect closes the writer
                 // and socket once the message has been sent.
                 return;
             }
@@ -1362,7 +1763,8 @@ impl Session {
         self.clients.insert(
             id,
             ClientHandle {
-                tx,
+                queue,
+                cancel,
                 state: ClientState::Parked,
                 username,
                 uuid,
@@ -1390,7 +1792,7 @@ impl Session {
             };
             let mut ok = true;
             for f in frames {
-                if c.tx.try_send(ClientOutput::Frame(f)).is_err() {
+                if !c.queue.try_send_frame(f) {
                     ok = false;
                     break;
                 }
@@ -1409,7 +1811,13 @@ impl Session {
         let Some(client) = self.clients.get(&id) else {
             return;
         };
-        spawn_client_batch(id, frames, client.tx.clone(), self.message_tx.clone());
+        spawn_client_batch(
+            id,
+            frames,
+            client.queue.clone(),
+            client.cancel.clone(),
+            self.message_tx.clone(),
+        );
     }
 
     fn on_replay_batch_finished(&mut self, id: ClientId, success: bool) {
@@ -1422,10 +1830,15 @@ impl Session {
             let Some(client) = self.clients.get_mut(&id) else {
                 return;
             };
-            let ClientState::Replaying { pending } = &mut client.state else {
+            let ClientState::Replaying {
+                pending,
+                pending_bytes,
+            } = &mut client.state
+            else {
                 return;
             };
             let pending = std::mem::take(pending);
+            *pending_bytes = 0;
             if pending.is_empty() {
                 client.state = ClientState::Live;
                 (pending, true, client.username.clone())
@@ -1438,9 +1851,9 @@ impl Session {
             tracing::info!("viewer {id} ('{username}') is live");
             if self.controller.is_none()
                 && self.opts.always_first_control
-                && self.promote_to_controller(id)
+                && self.begin_promotion(id)
             {
-                self.feedback(id, "you have control now (always_first_control)");
+                self.feedback(id, "preparing control handoff (always_first_control)");
             }
         } else {
             tracing::debug!(
@@ -1517,20 +1930,29 @@ impl Session {
         let viewers_receive = self.viewers_receive(&frame);
         let mut dead = Vec::new();
         for (&id, c) in self.clients.iter_mut() {
-            let deliver = Some(id) == self.controller || viewers_receive;
+            let deliver = Some(id) == self.controller
+                || Some(id) == self.pending_controller
+                || viewers_receive;
             if !deliver {
                 continue;
             }
             match &mut c.state {
-                ClientState::Live => {
-                    if c.tx.try_send(ClientOutput::Frame(frame.clone())).is_err() {
+                ClientState::Live | ClientState::Promoting => {
+                    if !c.queue.try_send_frame(frame.clone()) {
                         dead.push(id);
                     }
                 }
-                ClientState::Replaying { pending } => {
-                    if pending.len() >= MAX_REPLAY_PENDING_FRAMES {
+                ClientState::Replaying {
+                    pending,
+                    pending_bytes,
+                } => {
+                    let frame_bytes = frame.queued_bytes();
+                    if pending.len() >= MAX_REPLAY_PENDING_FRAMES
+                        || pending_bytes.saturating_add(frame_bytes) > MAX_REPLAY_PENDING_BYTES
+                    {
                         dead.push(id);
                     } else {
+                        *pending_bytes += frame_bytes;
                         pending.push(frame.clone());
                     }
                 }
@@ -1547,26 +1969,32 @@ impl Session {
     fn send_to_viewers(&mut self, frames: &[Frame]) {
         let mut dead = Vec::new();
         for (&id, c) in self.clients.iter_mut() {
-            if Some(id) == self.controller {
+            if Some(id) == self.controller || Some(id) == self.pending_controller {
                 continue;
             }
             match &mut c.state {
                 ClientState::Live => {
-                    if !frames
-                        .iter()
-                        .all(|f| c.tx.try_send(ClientOutput::Frame(f.clone())).is_ok())
-                    {
+                    if !frames.iter().all(|f| c.queue.try_send_frame(f.clone())) {
                         dead.push(id);
                     }
                 }
-                ClientState::Replaying { pending } => {
-                    if pending.len().saturating_add(frames.len()) > MAX_REPLAY_PENDING_FRAMES {
+                ClientState::Replaying {
+                    pending,
+                    pending_bytes,
+                } => {
+                    let added_bytes = frames.iter().fold(0usize, |total, frame| {
+                        total.saturating_add(frame.queued_bytes())
+                    });
+                    if pending.len().saturating_add(frames.len()) > MAX_REPLAY_PENDING_FRAMES
+                        || pending_bytes.saturating_add(added_bytes) > MAX_REPLAY_PENDING_BYTES
+                    {
                         dead.push(id);
                     } else {
+                        *pending_bytes += added_bytes;
                         pending.extend(frames.iter().cloned());
                     }
                 }
-                ClientState::Parked | ClientState::Joining => {}
+                ClientState::Parked | ClientState::Joining | ClientState::Promoting => {}
             }
         }
         for id in dead {
@@ -1575,24 +2003,29 @@ impl Session {
     }
 
     fn drop_client(&mut self, id: ClientId, reason: &str) {
+        let was_pending_controller = self.pending_controller == Some(id);
         if let Some(c) = self.clients.remove(&id) {
+            c.cancel.cancel();
             tracing::info!("client {id} ('{}') dropped: {reason}", c.username);
             let _ = self.events.send(ProxyEvent::ClientLeft {
                 id,
                 username: c.username,
             });
-            // dropping c.tx ends the writer task, which closes the socket
+            // cancellation stops replay/reader/writer tasks and closes the socket
+        }
+        if was_pending_controller {
+            self.pending_controller = None;
         }
         if self.controller == Some(id) {
             self.controller = None;
-            if self.opts.always_first_control {
+            if self.opts.always_first_control && self.pending_controller.is_none() {
                 // the original's alwaysFirstControl: oldest live client
                 // inherits control immediately
                 if let Some(next) = self.promote_oldest_live(None) {
                     tracing::info!(
                         "controller left; promoting client {next} (always_first_control)"
                     );
-                    self.feedback(next, "previous controller left — you have control now");
+                    self.feedback(next, "previous controller left — preparing handoff");
                     return;
                 }
             }
@@ -1602,6 +2035,19 @@ impl Session {
             let _ = self
                 .events
                 .send(ProxyEvent::ControlChanged { controller: None });
+        } else if was_pending_controller
+            && self.controller.is_none()
+            && self.opts.always_first_control
+        {
+            // The old controller may have left while this handoff was
+            // flushing. If the candidate then disappears too, continue
+            // failover instead of getting stuck controllerless.
+            if let Some(next) = self.promote_oldest_live(None) {
+                tracing::info!(
+                    "pending controller left; promoting client {next} (always_first_control)"
+                );
+                self.feedback(next, "previous handoff failed — preparing control");
+            }
         }
     }
 
@@ -1615,7 +2061,7 @@ impl Session {
 
     fn promote_oldest_live(&mut self, exclude: Option<ClientId>) -> Option<ClientId> {
         while let Some(id) = self.oldest_live_client(exclude) {
-            if self.promote_to_controller(id) {
+            if self.begin_promotion(id) {
                 return Some(id);
             }
             // A failed promotion drops that client; try the next one.
@@ -1635,15 +2081,25 @@ impl Session {
         let mut failed = false;
         for frame in frames {
             match &mut client.state {
-                ClientState::Replaying { pending } => {
-                    if pending.len() >= MAX_REPLAY_PENDING_FRAMES {
+                ClientState::Replaying {
+                    pending,
+                    pending_bytes,
+                } => {
+                    let frame_bytes = frame.queued_bytes();
+                    if pending.len() >= MAX_REPLAY_PENDING_FRAMES
+                        || pending_bytes.saturating_add(frame_bytes) > MAX_REPLAY_PENDING_BYTES
+                    {
                         failed = true;
                         break;
                     }
+                    *pending_bytes += frame_bytes;
                     pending.push(frame);
                 }
-                ClientState::Parked | ClientState::Joining | ClientState::Live => {
-                    if client.tx.try_send(ClientOutput::Frame(frame)).is_err() {
+                ClientState::Parked
+                | ClientState::Joining
+                | ClientState::Live
+                | ClientState::Promoting => {
+                    if !client.queue.try_send_frame(frame) {
                         failed = true;
                         break;
                     }
@@ -1669,7 +2125,7 @@ mod tests {
         body.extend_from_slice(&z.to_be_bytes());
         Frame {
             packet_id: ids::CB_GAME_LEVEL_CHUNK_WITH_LIGHT,
-            body,
+            body: body.into(),
         }
     }
 
@@ -1698,20 +2154,21 @@ mod tests {
         let frames = (0..frame_count)
             .map(|packet_id| Frame {
                 packet_id,
-                body: Vec::new(),
+                body: bytes::Bytes::new(),
             })
             .collect();
         // Deliberately tiny: the batch sender must wait for the writer
         // instead of treating normal backpressure as a disconnect.
-        let (output_tx, mut output_rx) = mpsc::channel::<ClientOutput>(2);
-        let (message_tx, mut message_rx) = mpsc::channel::<SessionMsg>(2);
-        spawn_client_batch(7, frames, output_tx, message_tx);
+        let (output_queue, mut output_rx) = ClientQueue::new(2);
+        let cancel = CancellationToken::new();
+        let (message_tx, mut message_rx) = SessionSender::new(2);
+        spawn_client_batch(7, frames, output_queue, cancel, message_tx);
 
         let received = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let mut received = 0;
             while let Some(output) = output_rx.recv().await {
                 match output {
-                    ClientOutput::Frame(frame) => {
+                    ClientOutput::Frame { frame, .. } => {
                         assert_eq!(frame.packet_id, received);
                         received += 1;
                     }
@@ -1730,6 +2187,37 @@ mod tests {
         match message_rx.recv().await {
             Some(SessionMsg::ReplayBatchFinished { id: 7, success }) => assert!(success),
             _ => panic!("expected successful replay completion"),
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_batch_cancels_while_backpressured() {
+        let frames = vec![
+            Frame {
+                packet_id: 1,
+                body: bytes::Bytes::new(),
+            },
+            Frame {
+                packet_id: 2,
+                body: bytes::Bytes::new(),
+            },
+        ];
+        let (output_queue, _output_rx) = ClientQueue::new(1);
+        let cancel = CancellationToken::new();
+        let (message_tx, mut message_rx) = SessionSender::new(1);
+        spawn_client_batch(9, frames, output_queue, cancel.clone(), message_tx);
+        tokio::task::yield_now().await;
+        cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), message_rx.recv())
+            .await
+            .expect("cancellation should unblock the replay task");
+        match result {
+            Some(SessionMsg::ReplayBatchFinished {
+                id: 9,
+                success: false,
+            }) => {}
+            _ => panic!("expected cancelled replay completion"),
         }
     }
 }

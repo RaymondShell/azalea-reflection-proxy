@@ -18,6 +18,18 @@ async fn main() -> Result<()> {
     if let Ok(cache) = std::env::var("PROXY_AUTH_CACHE") {
         b = b.auth_cache(cache);
     }
+    if let Ok(max) = std::env::var("PROXY_MAX_CLIENTS") {
+        b = b.max_clients(
+            max.parse()
+                .map_err(|_| eyre::eyre!("PROXY_MAX_CLIENTS must be a positive integer"))?,
+        );
+    }
+    if let Ok(max) = std::env::var("PROXY_MAX_PENDING_HANDSHAKES") {
+        b =
+            b.max_pending_handshakes(max.parse().map_err(|_| {
+                eyre::eyre!("PROXY_MAX_PENDING_HANDSHAKES must be a positive integer")
+            })?);
+    }
 
     let proxy = b.spawn().await?;
     tracing::info!(

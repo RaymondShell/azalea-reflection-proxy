@@ -48,7 +48,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use eyre::Result;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, watch, Mutex, Semaphore};
 use tokio::task::JoinHandle;
 
 pub use plugin::{Frame, Pipeline, ProxyPlugin, Verdict};
@@ -88,6 +88,7 @@ pub struct ProxyBuilder {
     plugins: Vec<Box<dyn ProxyPlugin>>,
     whitelist: Vec<String>,
     max_clients: Option<usize>,
+    max_pending_handshakes: usize,
     always_first_control: bool,
 }
 
@@ -101,7 +102,8 @@ impl Default for ProxyBuilder {
             auth_cache: None,
             plugins: Vec::new(),
             whitelist: Vec::new(),
-            max_clients: None,
+            max_clients: Some(16),
+            max_pending_handshakes: 32,
             always_first_control: false,
         }
     }
@@ -159,9 +161,16 @@ impl ProxyBuilder {
         self
     }
 
-    /// Cap simultaneous clients (controller + viewers). Default: no cap.
+    /// Cap simultaneous clients (controller + viewers). Default: 16.
     pub fn max_clients(mut self, max: usize) -> Self {
         self.max_clients = Some(max);
+        self
+    }
+
+    /// Cap local TCP handshakes that may be in progress at once. Excess
+    /// sockets are closed before a task is spawned. Default: 32.
+    pub fn max_pending_handshakes(mut self, max: usize) -> Self {
+        self.max_pending_handshakes = max;
         self
     }
 
@@ -182,6 +191,9 @@ impl ProxyBuilder {
         if self.max_clients == Some(0) {
             eyre::bail!("ProxyBuilder::max_clients must be at least 1");
         }
+        if self.max_pending_handshakes == 0 {
+            eyre::bail!("ProxyBuilder::max_pending_handshakes must be at least 1");
+        }
         let listener = local_server::listen(&local_server::LocalServerConfig {
             bind: self.bind.clone(),
         })
@@ -197,7 +209,7 @@ impl ProxyBuilder {
         let pipeline = Arc::new(Pipeline {
             plugins: self.plugins,
         });
-        let registry: SessionRegistry = Arc::new(Mutex::new(None));
+        let registry: SessionRegistry = Arc::new(Mutex::new(SessionRegistryState::Idle));
         let (events_tx, _) = broadcast::channel(256);
         let shared = Arc::new(Shared {
             cfg,
@@ -205,6 +217,7 @@ impl ProxyBuilder {
             registry,
             events: events_tx.clone(),
             whitelist: self.whitelist,
+            handshake_limit: Arc::new(Semaphore::new(self.max_pending_handshakes)),
             opts: session::SessionOpts {
                 max_clients: self.max_clients,
                 always_first_control: self.always_first_control,
@@ -264,7 +277,13 @@ impl ReflectionProxy {
 /// At most one live session; new connections attach to it as viewers.
 /// When its sender reports closed the session task has exited, and the
 /// next connection becomes a fresh controller.
-type SessionRegistry = Arc<Mutex<Option<mpsc::Sender<session::SessionMsg>>>>;
+enum SessionRegistryState {
+    Idle,
+    Connecting(watch::Sender<bool>),
+    Live(session::SessionSender),
+}
+
+type SessionRegistry = Arc<Mutex<SessionRegistryState>>;
 
 /// Everything the accept path needs, bundled once at spawn.
 struct Shared {
@@ -273,6 +292,7 @@ struct Shared {
     registry: SessionRegistry,
     events: broadcast::Sender<ProxyEvent>,
     whitelist: Vec<String>,
+    handshake_limit: Arc<Semaphore>,
     opts: session::SessionOpts,
 }
 
@@ -288,8 +308,17 @@ async fn accept_loop(listener: tokio::net::TcpListener, shared: Arc<Shared>) {
             }
         };
         tracing::info!("connection from {addr}");
+        let permit = match shared.handshake_limit.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!("connection from {addr} rejected: too many pending handshakes");
+                drop(stream);
+                continue;
+            }
+        };
         let shared = shared.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle_connection(stream, shared).await {
                 // status pings land here too, so this is not an error
                 tracing::info!("connection ended: {e:#}");
@@ -330,31 +359,74 @@ async fn handle_connection(stream: tokio::net::TcpStream, shared: Arc<Shared>) -
 
     let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
 
-    // Held across the upstream connect on purpose: a second client that
-    // races in while the controller is still authenticating waits here,
-    // then attaches as a viewer instead of spawning a second session.
-    let mut guard = shared.registry.lock().await;
-
-    if let Some(tx) = guard.as_ref().filter(|tx| !tx.is_closed()).cloned() {
-        drop(guard);
-        session::attach_viewer(&tx, id, local).await?;
-        tracing::info!("'{username}' attached as viewer (client {id})");
-        return Ok(());
+    enum RegistryDecision {
+        Attach(session::SessionSender),
+        Wait(watch::Receiver<bool>),
+        Start(watch::Sender<bool>),
     }
 
-    tracing::info!("'{username}' is the controller (client {id}); connecting upstream");
-    let up = upstream::connect(&shared.cfg).await?;
-    tracing::info!("upstream established as {}", up.profile.name);
+    loop {
+        let decision = {
+            let mut guard = shared.registry.lock().await;
+            match &*guard {
+                SessionRegistryState::Live(tx) if !tx.is_closed() => {
+                    RegistryDecision::Attach(tx.clone())
+                }
+                SessionRegistryState::Live(_) => {
+                    *guard = SessionRegistryState::Idle;
+                    continue;
+                }
+                SessionRegistryState::Connecting(ready) => {
+                    RegistryDecision::Wait(ready.subscribe())
+                }
+                SessionRegistryState::Idle => {
+                    let (ready, _) = watch::channel(false);
+                    *guard = SessionRegistryState::Connecting(ready.clone());
+                    RegistryDecision::Start(ready)
+                }
+            }
+        };
 
-    *guard = Some(session::spawn(
-        up,
-        local,
-        id,
-        shared.pipeline.clone(),
-        shared.opts.clone(),
-        shared.events.clone(),
-    ));
-    Ok(())
+        match decision {
+            RegistryDecision::Attach(tx) => {
+                session::attach_viewer(&tx, id, local).await?;
+                tracing::info!("'{username}' attached as viewer (client {id})");
+                return Ok(());
+            }
+            RegistryDecision::Wait(mut ready) => {
+                tokio::time::timeout(std::time::Duration::from_secs(120), ready.changed())
+                    .await
+                    .map_err(|_| eyre::eyre!("timed out waiting for the session to start"))?
+                    .map_err(|_| eyre::eyre!("session startup coordinator closed"))?;
+            }
+            RegistryDecision::Start(ready) => {
+                tracing::info!("'{username}' is the controller (client {id}); connecting upstream");
+                let upstream = upstream::connect(&shared.cfg).await;
+                let mut guard = shared.registry.lock().await;
+                match upstream {
+                    Ok(up) => {
+                        tracing::info!("upstream established as {}", up.profile.name);
+                        let tx = session::spawn(
+                            up,
+                            local,
+                            id,
+                            shared.pipeline.clone(),
+                            shared.opts.clone(),
+                            shared.events.clone(),
+                        );
+                        *guard = SessionRegistryState::Live(tx);
+                        let _ = ready.send(true);
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        *guard = SessionRegistryState::Idle;
+                        let _ = ready.send(true);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Split a DNS/IPv4 `host:port` or bracketed IPv6 `[host]:port` target.

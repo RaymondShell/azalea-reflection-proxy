@@ -19,7 +19,26 @@
 #[derive(Clone, Debug)]
 pub struct Frame {
     pub packet_id: u32,
-    pub body: Vec<u8>,
+    /// Reference-counted so broadcasting a large chunk frame to several
+    /// clients does not deep-copy the packet body for every recipient.
+    pub body: bytes::Bytes,
+}
+
+impl Frame {
+    /// Build a frame from any byte container accepted by [`bytes::Bytes`],
+    /// including `Vec<u8>` and static byte slices.
+    pub fn new(packet_id: u32, body: impl Into<bytes::Bytes>) -> Self {
+        Self {
+            packet_id,
+            body: body.into(),
+        }
+    }
+
+    /// Conservative encoded size for queue accounting (packet id varint +
+    /// body). The actual packet-length prefix is owned by Azalea's writer.
+    pub(crate) fn queued_bytes(&self) -> usize {
+        self.body.len().saturating_add(5)
+    }
 }
 
 /// What the pipeline should do with a frame after a plugin saw it.
