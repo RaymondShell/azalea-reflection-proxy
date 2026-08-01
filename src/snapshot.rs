@@ -311,6 +311,11 @@ impl WorldSnapshot {
         self.player_entity_id = Some(id);
     }
 
+    #[cfg(test)]
+    pub(crate) fn player_entity_id(&self) -> Option<i32> {
+        self.player_entity_id
+    }
+
     pub fn selected_hotbar_slot(&self) -> u32 {
         self.selected_hotbar_slot
     }

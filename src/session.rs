@@ -389,6 +389,23 @@ impl JoinCache {
         cache
     }
 
+    /// Start a server-driven configuration cycle without forgetting the
+    /// immutable game-login identity needed to attach late viewers.
+    ///
+    /// Modern servers may return to configuration without sending another
+    /// game Login packet afterwards. World-shaped state must be discarded,
+    /// but dropping the original Login frame leaves subsequently joined
+    /// viewers unable to enter the game state at all.
+    fn begin_reconfiguration(&mut self, bot_uuid: Uuid, player_entity_id: Option<i32>) {
+        let login = self.login.take();
+        let mut fresh = Self::new(bot_uuid);
+        fresh.login = login;
+        if let Some(player_entity_id) = player_entity_id {
+            fresh.world.set_player_entity_id(player_entity_id);
+        }
+        *self = fresh;
+    }
+
     /// The dimension changed: everything tied to the old world is stale.
     fn on_respawn(&mut self, respawn: Frame, data_to_keep: u8) {
         self.respawn = Some(respawn);
@@ -447,7 +464,9 @@ struct Session {
     pending_controller: Option<ClientId>,
     cache: JoinCache,
     upstream_state: UpstreamState,
-    seen_first_game_frame: bool,
+    /// True only until the initial connection's first game-state frame.
+    /// A server reconfiguration does not necessarily produce another Login.
+    expecting_initial_game_login: bool,
     /// The real account's identity, for the reflected entity viewers see.
     bot_uuid: Uuid,
     bot_name: String,
@@ -554,7 +573,7 @@ pub fn spawn(
         pending_controller: None,
         cache,
         upstream_state: UpstreamState::Config,
-        seen_first_game_frame: false,
+        expecting_initial_game_login: true,
         bot_uuid,
         bot_name,
         pose: BotPose::default(),
@@ -957,15 +976,14 @@ impl Session {
             UpstreamState::Config => match f.packet_id {
                 ids::CB_CONFIG_FINISH => {
                     self.upstream_state = UpstreamState::Game;
-                    self.seen_first_game_frame = false;
                 }
                 // never replay stale keepalives/pings to a joining viewer
                 ids::CB_CONFIG_KEEP_ALIVE | ids::CB_CONFIG_PING => {}
                 _ => self.cache.config_frames.push(f.clone()),
             },
             UpstreamState::Game => {
-                if !self.seen_first_game_frame {
-                    self.seen_first_game_frame = true;
+                if self.expecting_initial_game_login {
+                    self.expecting_initial_game_login = false;
                     if f.packet_id != ids::CB_GAME_LOGIN {
                         // runtime guard for the one id we can't pin in tests
                         tracing::warn!(
@@ -1037,11 +1055,15 @@ impl Session {
                         }
                     }
                     ids::CB_GAME_START_CONFIGURATION => {
-                        // server is reconfiguring: every cached frame is
-                        // stale. Live viewers follow the transition like
-                        // the controller does (their acks are swallowed).
+                        // Server reconfiguration invalidates world-shaped
+                        // replay data, but it may not be followed by another
+                        // Login packet. Preserve the original login identity
+                        // so late viewers can still enter the game state.
+                        // Live viewers follow the transition like the
+                        // controller does (their acks are swallowed).
                         self.upstream_state = UpstreamState::Config;
-                        self.cache = JoinCache::new(self.bot_uuid);
+                        self.cache
+                            .begin_reconfiguration(self.bot_uuid, self.real_player_id);
                     }
                     _ => {}
                 }
@@ -2146,6 +2168,37 @@ mod tests {
             .filter_map(|frame| ids::chunk_key(&frame.body))
             .collect();
         assert_eq!(chunks, [(0, 0), (1, 0), (-2, 0), (8, 8)]);
+    }
+
+    #[test]
+    fn reconfiguration_preserves_login_but_drops_old_world_state() {
+        let bot_uuid = Uuid::new_v4();
+        let login = Frame {
+            packet_id: ids::CB_GAME_LOGIN,
+            body: bytes::Bytes::from_static(b"login"),
+        };
+        let mut cache = JoinCache::new(bot_uuid);
+        cache.login = Some(login.clone());
+        cache.last_position = Some(Frame {
+            packet_id: ids::CB_GAME_PLAYER_POSITION,
+            body: bytes::Bytes::new(),
+        });
+        cache.chunks.insert((0, 0), chunk_frame(0, 0));
+        cache.config_frames.push(Frame {
+            packet_id: 1,
+            body: bytes::Bytes::new(),
+        });
+
+        cache.begin_reconfiguration(bot_uuid, Some(42));
+
+        assert_eq!(
+            cache.login.as_ref().map(|frame| frame.body.clone()),
+            Some(login.body)
+        );
+        assert!(cache.config_frames.is_empty());
+        assert!(cache.last_position.is_none());
+        assert!(cache.chunks.is_empty());
+        assert_eq!(cache.world.player_entity_id(), Some(42));
     }
 
     #[tokio::test]
